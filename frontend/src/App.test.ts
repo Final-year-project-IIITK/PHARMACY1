@@ -1,5 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { filterMedicinesByQuery, getExpirySnapshot, splitSaleInvoicesByDay } from './App';
+import { filterMedicinesByQuery, getExpirySnapshot, splitProcurementRequests, splitSaleInvoicesByDay, upsertMedicineInList } from './App';
+
+describe('splitProcurementRequests', () => {
+    it('separates requests awaiting approval from sent requests', () => {
+        const requests = [
+            { id: 1, status: 'pending_review' },
+            { id: 2, status: 'sent' },
+        ];
+
+        const result = splitProcurementRequests(requests);
+
+        expect(result.awaitingApproval.map((request) => request.id)).toEqual([1]);
+        expect(result.sent.map((request) => request.id)).toEqual([2]);
+    });
+});
 
 describe('getExpirySnapshot', () => {
     it('marks expired stock as black', () => {
@@ -7,6 +21,33 @@ describe('getExpirySnapshot', () => {
 
         expect(result.expiryBand).toBe('black');
         expect(result.expiryLabel).toBe('Expired');
+    });
+
+    describe('upsertMedicineInList', () => {
+        const medicine = (id: number, name: string) => ({
+            id,
+            name,
+            sku: `MED-${id}`,
+            category: 'Test',
+            unit: 'tablet',
+            reorder_level: 5,
+            ideal_stock: 20,
+            active: true,
+            created_at: '2026-01-01T00:00:00',
+        });
+
+        it('adds new medicines and replaces edits without duplicating entries', () => {
+            const existing = medicine(1, 'Beta');
+            const created = upsertMedicineInList([existing], medicine(2, 'Alpha'));
+
+            expect(created.created).toBe(true);
+            expect(created.medicines.map((entry) => entry.name)).toEqual(['Alpha', 'Beta']);
+
+            const edited = upsertMedicineInList(created.medicines, medicine(1, 'Aardvark'));
+            expect(edited.created).toBe(false);
+            expect(edited.medicines.map((entry) => entry.name)).toEqual(['Aardvark', 'Alpha']);
+            expect(edited.medicines).toHaveLength(2);
+        });
     });
 
     describe('splitSaleInvoicesByDay', () => {

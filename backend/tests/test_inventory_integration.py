@@ -9,10 +9,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.api import routes as api_routes
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
-from app.models.entities import Pharmacy, User
+from app.models.entities import Pharmacy, Supplier, User
 from app.services.auth import create_access_token, hash_password
 
 
@@ -442,3 +443,66 @@ def test_expired_collection_removes_department_stock_and_records_full_quantity(i
         if transaction["transaction_type"] == "Expiry disposal"
     )
     assert disposal["quantity"] == 20
+
+
+def test_procurement_scan_round_robins_active_medicine_suppliers(
+    inventory_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_generator = app.dependency_overrides[get_db]()
+    db = next(db_generator)
+    try:
+        db.add(Supplier(
+            company_name="Waste Collector",
+            contact_person="Waste Contact",
+            phone="9000000000",
+            email="waste@example.test",
+            gst_number="WASTE-TEST",
+            address="Test",
+            waste_vendor=True,
+        ))
+        db.add_all([
+            Supplier(
+                company_name="Supplier A",
+                contact_person="Contact A",
+                phone="9000000001",
+                email="supplier-a@example.test",
+                gst_number="SUPPLIER-A",
+                address="Test",
+            ),
+            Supplier(
+                company_name="Supplier B",
+                contact_person="Contact B",
+                phone="9000000002",
+                email="supplier-b@example.test",
+                gst_number="SUPPLIER-B",
+                address="Test",
+            ),
+        ])
+        db.commit()
+    finally:
+        db_generator.close()
+
+    monkeypatch.setattr(api_routes, "send_procurement_email", lambda **kwargs: False)
+    for index in range(3):
+        response = inventory_client.post(
+            "/api/v1/medicines",
+            json={
+                "name": f"Procurement Medicine {index}",
+                "sku": f"PROC-{index}",
+                "category": "Test",
+                "unit": "tablet",
+            },
+        )
+        assert response.status_code == 201
+
+    scan_response = inventory_client.post("/api/v1/procurement/scan")
+    assert scan_response.status_code == 200
+    requests = scan_response.json()
+    assert [(request["supplier_name"], request["supplier_email"]) for request in requests] == [
+        ("Supplier A", "supplier-a@example.test"),
+        ("Supplier B", "supplier-b@example.test"),
+        ("Supplier A", "supplier-a@example.test"),
+    ]
+    assert all(request["status"] == "pending_review" for request in requests)
+    assert inventory_client.post("/api/v1/procurement/scan").json() == []

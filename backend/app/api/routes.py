@@ -823,21 +823,32 @@ def create_procurement_requests_from_alerts(
 ) -> list[ProcurementRequestRead]:
     """Create one reviewable supplier request per alerting medicine and notify the admin."""
     alerts = _build_alerts(db, current_user)
-    active_supplier = db.query(Supplier).filter(Supplier.active.is_(True)).order_by(Supplier.id.asc()).first()
-    if not active_supplier:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Add an active supplier before creating procurement requests")
+    active_suppliers = (
+        db.query(Supplier)
+        .filter(Supplier.active.is_(True), Supplier.waste_vendor.is_(False))
+        .order_by(Supplier.id.asc())
+        .all()
+    )
+    if not active_suppliers:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Add an active medicine supplier before creating procurement requests")
 
+    existing_requests = db.query(ProcurementRequest).filter(
+        ProcurementRequest.pharmacy_id == current_user.pharmacy_id,
+        ProcurementRequest.status.in_(["pending_review", "sent"]),
+    ).all()
     existing_medicine_ids = {
         line["medicine_id"]
-        for request in db.query(ProcurementRequest).filter(ProcurementRequest.pharmacy_id == current_user.pharmacy_id, ProcurementRequest.status.in_(["pending_review", "sent"])).all()
+        for request in existing_requests
         for line in json.loads(request.item_lines)
     }
+    supplier_index = len(existing_medicine_ids)
     alerts_by_medicine: dict[int, list[AlertRead]] = {}
     for alert in alerts:
         alerts_by_medicine.setdefault(alert.medicine_id, []).append(alert)
 
     created: list[ProcurementRequest] = []
-    for medicine_id, medicine_alerts in alerts_by_medicine.items():
+    for medicine_id in sorted(alerts_by_medicine):
+        medicine_alerts = alerts_by_medicine[medicine_id]
         if medicine_id in existing_medicine_ids:
             continue
         medicine = db.query(Medicine).filter(Medicine.id == medicine_id).first()
@@ -849,10 +860,11 @@ def create_procurement_requests_from_alerts(
         unit_price = settings.procurement_unit_price
         line = {"medicine_id": medicine.id, "medicine_name": medicine.name, "sku": medicine.sku, "quantity": quantity, "unit_price": unit_price, "line_total": quantity * unit_price, "reason": reasons}
         request_number = f"PR-{date.today():%Y%m%d}-{medicine.id:03d}"
+        supplier = active_suppliers[supplier_index % len(active_suppliers)]
         request = ProcurementRequest(
             request_number=request_number,
-            supplier_name=active_supplier.company_name,
-            supplier_email=active_supplier.email,
+            supplier_name=supplier.company_name,
+            supplier_email=supplier.email,
             trigger_summary=f"Automatic safety trigger: {reasons} for {medicine.name}.",
             item_lines=json.dumps([line]),
             estimated_total=line["line_total"],
@@ -860,6 +872,7 @@ def create_procurement_requests_from_alerts(
         )
         db.add(request)
         created.append(request)
+        supplier_index += 1
     db.commit()
 
     for request in created:

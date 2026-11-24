@@ -411,6 +411,27 @@ export function filterMedicinesByQuery<T extends Pick<Medicine, 'name' | 'sku' |
     );
 }
 
+export function upsertMedicineInList(
+    medicines: Medicine[],
+    savedMedicine: Medicine,
+): { medicines: Medicine[]; created: boolean } {
+    const created = !medicines.some((medicine) => medicine.id === savedMedicine.id);
+    return {
+        medicines: [...medicines.filter((medicine) => medicine.id !== savedMedicine.id), savedMedicine]
+            .sort((left, right) => left.name.localeCompare(right.name)),
+        created,
+    };
+}
+
+export function splitProcurementRequests<T extends Pick<ProcurementRequest, 'status'>>(
+    requests: T[],
+): { awaitingApproval: T[]; sent: T[] } {
+    return {
+        awaitingApproval: requests.filter((request) => request.status !== 'sent'),
+        sent: requests.filter((request) => request.status === 'sent'),
+    };
+}
+
 export default function App() {
     const [token, setToken] = useState<string | null>(() => localStorage.getItem(TOKEN_KEY));
     const [currentUser, setCurrentUser] = useState<User | null>(() => {
@@ -931,6 +952,16 @@ export default function App() {
         } catch (error) { setStatus(error instanceof Error ? error.message : 'Supplier order was not sent'); }
     }
 
+    function renderProcurementRequest(request: ProcurementRequest) {
+        return (
+            <article className={`procurement-card ${request.status}`} key={request.id}>
+                <div className="procurement-top"><div><span className="request-number">{request.request_number}</span><h3>{request.item_lines.map((line) => line.medicine_name).join(', ')}</h3><p>{request.trigger_summary}</p></div><span className={`procurement-status ${request.status}`}>{request.status === 'sent' ? 'Sent to supplier' : 'Awaiting approval'}</span></div>
+                <div className="procurement-line"><span>{request.item_lines[0]?.quantity} units · {request.item_lines[0]?.reason}</span><strong>₹{request.estimated_total.toLocaleString()}</strong></div>
+                <div className="procurement-footer"><span>Supplier: <strong>{request.supplier_name}</strong> · {request.supplier_email}</span>{request.status === 'sent' ? <span className="invoice-badge">{request.invoice_number} generated</span> : <button className="primary inline" onClick={() => sendProcurement(request.id)}>Approve & send order</button>}</div>
+            </article>
+        );
+    }
+
     async function uploadMedicines() {
         if (!token || !importFile) { setStatus('Select a CSV file first'); return; }
         try {
@@ -1037,7 +1068,8 @@ export default function App() {
         if (!token) {
             return;
         }
-            const payload = {
+        const creating = editingMedicineId === null;
+        const payload = {
             name: medicineForm.name,
             sku: medicineForm.sku,
             category: medicineForm.category,
@@ -1054,15 +1086,46 @@ export default function App() {
             } else {
                 savedMedicine = await apiRequest<Medicine>('/medicines', token, { method: 'POST', body: JSON.stringify(payload) });
             }
+            if (creating) {
+                setDashboardData((previous) => {
+                    if (!previous) {
+                        return previous;
+                    }
+                    const { medicines, created } = upsertMedicineInList(previous.medicines, savedMedicine);
+                    const countChange = created ? 1 : 0;
+                    return {
+                        ...previous,
+                        medicines,
+                        summary: { ...previous.summary, medicines: previous.summary.medicines + countChange },
+                        insights: { ...previous.insights, total_medicines: previous.insights.total_medicines + countChange },
+                    };
+                });
+            }
             setMedicineForm(emptyMedicineForm);
             setEditingMedicineId(null);
-            const refreshed = await loadWorkspace(savedMedicine.id);
-            setSelectedMedicineId(savedMedicine.id);
-            setBatchForm((previous) => ({ ...previous, medicine_id: String(savedMedicine.id) }));
-            navigate('batches');
-            setStatus(refreshed
-                ? `Medicine saved. Add a received batch for ${savedMedicine.name} to place stock in storage.`
-                : `Medicine saved, but some views could not refresh. Use Refresh list before continuing.`);
+            if (creating) {
+                setSelectedMedicineId(savedMedicine.id);
+                setBatchForm((previous) => ({ ...previous, medicine_id: String(savedMedicine.id) }));
+                navigate('batches');
+                setStatus(`Medicine saved. Add a received batch for ${savedMedicine.name} to place stock in storage.`);
+                void apiRequest<Activity[]>('/activity', token)
+                    .then((activities) => {
+                        setDashboardData((previous) => previous ? { ...previous, activities } : previous);
+                    })
+                    .catch((error) => {
+                        setStatus(error instanceof Error
+                            ? `Medicine saved, but recent activity could not refresh: ${error.message}`
+                            : 'Medicine saved, but recent activity could not refresh');
+                    });
+            } else {
+                const refreshed = await loadWorkspace(savedMedicine.id);
+                setSelectedMedicineId(savedMedicine.id);
+                setBatchForm((previous) => ({ ...previous, medicine_id: String(savedMedicine.id) }));
+                navigate('batches');
+                setStatus(refreshed
+                    ? `Medicine saved. Add a received batch for ${savedMedicine.name} to place stock in storage.`
+                    : `Medicine saved, but some views could not refresh. Use Refresh list before continuing.`);
+            }
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Medicine save failed');
         }
@@ -1381,6 +1444,8 @@ export default function App() {
             navigate('welcome');
         }
     }, [activeTab, currentUser?.role]);
+
+    const { awaitingApproval: requestsAwaitingApproval, sent: sentProcurementRequests } = splitProcurementRequests(procurementRequests);
 
     if (!token || !currentUser) {
         return (
@@ -2105,15 +2170,17 @@ export default function App() {
                         <div className="panel procurement-hero">
                             <div className="panel-header"><div><div className="section-title">Automated procurement</div><h3>Safety alerts → admin review → supplier order → pro forma invoice</h3><p className="muted">A scan groups low-stock and near-expiry risks into reviewable requests. Nothing is sent to a supplier until you explicitly approve it.</p></div><button className="primary inline" onClick={scanProcurement}>Run safety scan</button></div>
                         </div>
-                        <div className="procurement-list">
-                            {procurementRequests.length === 0 && <div className="panel empty-procurement"><strong>No requests yet.</strong><span>Run a safety scan to prepare reviewable supplier orders from current alerts.</span></div>}
-                            {procurementRequests.map((request) => (
-                                <article className={`procurement-card ${request.status}`} key={request.id}>
-                                    <div className="procurement-top"><div><span className="request-number">{request.request_number}</span><h3>{request.item_lines.map((line) => line.medicine_name).join(', ')}</h3><p>{request.trigger_summary}</p></div><span className={`procurement-status ${request.status}`}>{request.status === 'sent' ? 'Sent to supplier' : 'Awaiting approval'}</span></div>
-                                    <div className="procurement-line"><span>{request.item_lines[0]?.quantity} units · {request.item_lines[0]?.reason}</span><strong>₹{request.estimated_total.toLocaleString()}</strong></div>
-                                    <div className="procurement-footer"><span>Supplier: <strong>{request.supplier_name}</strong> · {request.supplier_email}</span>{request.status === 'sent' ? <span className="invoice-badge">{request.invoice_number} generated</span> : <button className="primary inline" onClick={() => sendProcurement(request.id)}>Approve & send order</button>}</div>
-                                </article>
-                            ))}
+                        <div className="panel procurement-section">
+                            <div className="procurement-section-heading"><div><div className="section-title">Approval queue</div><h3>Approve & send orders</h3></div><span className="recommendation">{requestsAwaitingApproval.length} awaiting</span></div>
+                            {requestsAwaitingApproval.length
+                                ? <div className="procurement-list">{requestsAwaitingApproval.map(renderProcurementRequest)}</div>
+                                : <div className="procurement-empty">No requests are waiting for approval.</div>}
+                        </div>
+                        <div className="panel procurement-section">
+                            <div className="procurement-section-heading"><div><div className="section-title">Order history</div><h3>Approved / sent requests</h3></div><span className="recommendation">{sentProcurementRequests.length} sent</span></div>
+                            {sentProcurementRequests.length
+                                ? <div className="procurement-list">{sentProcurementRequests.map(renderProcurementRequest)}</div>
+                                : <div className="procurement-empty">No orders have been sent yet.</div>}
                         </div>
                     </section>
                 )}

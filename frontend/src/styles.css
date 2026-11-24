@@ -1266,6 +1266,27 @@ body {
     align-items: center;
 }
 
+.procurement-section {
+    display: grid;
+    gap: 16px;
+}
+
+.procurement-section-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+}
+
+.procurement-section-heading h3 {
+    margin: 4px 0 0;
+}
+
+.procurement-empty {
+    padding: 8px 0 4px;
+    color: var(--muted);
+}
+
 .procurement-list {
     display: grid;
     gap: 14px;
@@ -1365,6 +1386,11 @@ body {
         align-items: flex-start;
         flex-direction: column;
         gap: 10px;
+    }
+
+    .procurement-section-heading {
+        align-items: flex-start;
+        flex-direction: column;
     }
 
     .procurement-hero .panel-header {
