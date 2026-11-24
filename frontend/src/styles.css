@@ -723,7 +723,7 @@ button {
     align-items: start;
 }
 
-@media (max-width: 1120px) {
+@media (max-width: 900px) {
 
     .shell,
     .layout-grid,
@@ -1407,6 +1407,7 @@ body {
     }
 
     .sticky-panel {
+        position: static;
         height: auto;
     }
 
@@ -1621,6 +1622,32 @@ body {
     grid-template-columns: minmax(0, 1.2fr) minmax(330px, .8fr);
 }
 
+.sales-history-panel {
+    grid-column: 1 / -1;
+}
+
+.bill-history-group + .bill-history-group {
+    margin-top: 24px;
+}
+
+.bill-history-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.bill-history-heading h4 {
+    margin: 0;
+    font-family: 'Space Grotesk', sans-serif;
+}
+
+.bill-history-heading span {
+    color: var(--muted);
+    font-size: .82rem;
+}
+
 .sales-panel {
     background: linear-gradient(135deg, #fff, #f0faf7);
 }
@@ -1681,15 +1708,48 @@ body {
 }
 
 .quick-bill-controls {
-    position: sticky;
-    top: 12px;
-    z-index: 2;
     margin-bottom: 16px;
     padding: 14px;
     border: 1px solid #b6ddd3;
     border-radius: 15px;
     background: rgba(255, 255, 255, .96);
     box-shadow: 0 8px 18px rgba(8, 104, 96, .08);
+}
+
+.bill-cart {
+    border: 1px solid #d5e9e3;
+    border-radius: 16px;
+    background: #fff;
+    padding: 16px;
+}
+
+.bill-cart .panel-header {
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.bill-cart .form-grid {
+    grid-template-columns: 1fr;
+}
+
+.bill-cart-items {
+    max-height: 190px;
+    overflow-y: auto;
+}
+
+.bill-cart .invoice-line {
+    align-items: center;
+}
+
+.bill-cart .bill-empty {
+    min-height: 76px;
+    margin-bottom: 12px;
+}
+
+.latest-invoice {
+    margin-top: 20px;
+    padding-top: 18px;
+    border-top: 1px solid #d5e9e3;
 }
 
 .sale-catalogue {
@@ -2230,7 +2290,85 @@ body {
     align-self: start;
     position: sticky;
     top: 22px;
+    max-height: calc(100vh - 44px);
+    overflow-y: auto;
     background: #fffdf9;
+}
+
+.business-workspace .gst-profile-panel,
+.business-workspace .accounting-summary-panel {
+    grid-column: 1 / -1;
+}
+
+.gst-scope-note {
+    display: grid;
+    gap: 5px;
+    margin: 14px 0;
+    padding: 13px 15px;
+    border: 1px solid #efdcae;
+    border-left: 4px solid #c89122;
+    border-radius: 12px;
+    background: #fff9eb;
+    color: #684e19;
+    font-size: .82rem;
+}
+
+.gst-scope-note span {
+    color: #74684f;
+    line-height: 1.5;
+}
+
+.tax-profile-summary {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin: 14px 0 18px;
+}
+
+.tax-profile-summary>div {
+    display: grid;
+    gap: 5px;
+    min-width: 0;
+    padding: 12px 14px;
+    border: 1px solid #d7e9e3;
+    border-radius: 13px;
+    background: linear-gradient(145deg, #f8fffc, #eff8f5);
+}
+
+.tax-profile-summary small {
+    color: var(--muted);
+    font-size: .72rem;
+}
+
+.tax-profile-summary strong {
+    overflow-wrap: anywhere;
+    color: #075e59;
+    font-size: .9rem;
+}
+
+.accounting-stats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin: 16px 0 22px;
+}
+
+.accounting-stats .stat-card {
+    min-height: 112px;
+}
+
+.payment-entry {
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+}
+
+.payment-entry .section-title {
+    display: inline-flex;
+    margin-bottom: 12px;
+}
+
+.payment-entry .form-grid {
+    grid-template-columns: minmax(0, 1.6fr) repeat(2, minmax(0, 1fr));
 }
 
 .storage-zone-grid {
@@ -2688,6 +2826,7 @@ body {
 
     .bill-preview {
         position: static;
+        max-height: none;
     }
 }
 
@@ -2716,6 +2855,15 @@ body {
     .expiry-control-grid {
         grid-template-columns: 1fr;
     }
+
+    .tax-profile-summary,
+    .accounting-stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .payment-entry .form-grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 @media (max-width: 700px) {
@@ -2724,6 +2872,11 @@ body {
 }
 
 @media (max-width: 620px) {
+    .tax-profile-summary,
+    .accounting-stats {
+        grid-template-columns: 1fr;
+    }
+
     .finance-intro {
         align-items: flex-start;
         flex-direction: column;
@@ -2748,6 +2901,8 @@ body {
     .hero-panel,
     .topbar,
     .sales-panel,
+    .sales-history-panel,
+    .bill-preview .bill-cart,
     .nav-stack,
     .bill-preview .panel-header button {
         display: none !important;
@@ -2768,8 +2923,16 @@ body {
 
     .bill-preview {
         display: block;
+        max-height: none;
+        overflow: visible;
         box-shadow: none;
         border: 0;
+    }
+
+    .latest-invoice {
+        margin-top: 0;
+        padding-top: 0;
+        border-top: 0;
     }
 }
 

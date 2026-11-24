@@ -134,6 +134,21 @@ class SaleInvoice(Base):
     sold_by: Mapped[str] = mapped_column(String(64), nullable=False)
     sold_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     pharmacy_id: Mapped[int | None] = mapped_column(ForeignKey("pharmacies.id"), nullable=True, index=True)
+    customer_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class SaleInvoiceLine(Base):
+    __tablename__ = "sale_invoice_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    sale_invoice_id: Mapped[int] = mapped_column(ForeignKey("sale_invoices.id"), nullable=False, index=True)
+    medicine_id: Mapped[int] = mapped_column(ForeignKey("medicines.id"), nullable=False, index=True)
+    medicine_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    sku: Mapped[str] = mapped_column(String(64), nullable=False)
+    batch_number: Mapped[str] = mapped_column(String(128), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_price: Mapped[float] = mapped_column(Float, nullable=False)
+    total_amount: Mapped[float] = mapped_column(Float, nullable=False)
 
 
 class InventoryTransaction(Base):

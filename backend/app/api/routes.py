@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models.entities import BatchStock, ConsumptionRecord, DepartmentInventory, Medicine, Pharmacy, User, MedicalEquipment, WastePickup
+from app.models.entities import BatchStock, ConsumptionRecord, Customer, DepartmentInventory, Medicine, Pharmacy, User, MedicalEquipment, WastePickup
 from app.schemas import (
     CategoryRead,
     AlertRead,
@@ -50,6 +50,8 @@ from app.schemas import (
     PlatformUserUpdate,
     DispenseRequest,
     SaleCreate,
+    SaleLineCreate,
+    SaleInvoiceLineRead,
     SaleInvoiceRead,
     ImportResult,
     DisposalRequest,
@@ -79,7 +81,7 @@ from app.services.auth import (
 from app.services.forecast import forecast_consumption
 from app.services.email_notifications import send_procurement_email
 from app.services.seed import add_who_starter_catalogue
-from app.models.entities import AccountingEntry, AuditLog, HospitalDepartment, InventoryTransaction, MedicineCategory, ProcurementInvoice, ProcurementRequest, PurchaseOrder, SaleInvoice, StorageLocation, Supplier
+from app.models.entities import AccountingEntry, AuditLog, HospitalDepartment, InventoryTransaction, MedicineCategory, ProcurementInvoice, ProcurementRequest, PurchaseOrder, SaleInvoice, SaleInvoiceLine, StorageLocation, Supplier
 
 settings = get_settings()
 router = APIRouter()
@@ -87,6 +89,40 @@ router = APIRouter()
 
 def _tenant_medicines(db: Session, user: User):
     return db.query(Medicine).filter(Medicine.pharmacy_id == user.pharmacy_id)
+
+
+def _available_units(
+    medicine: Medicine,
+    today: date | None = None,
+    department_units_by_batch: dict[tuple[int, str], int] | None = None,
+) -> int:
+    as_of = today or date.today()
+    if not medicine.active:
+        return 0
+    return sum(
+        batch.quantity + (department_units_by_batch or {}).get((medicine.id, batch.batch_number), 0)
+        for batch in medicine.batches
+        if batch.disposal_status == "active" and batch.expiry_date >= as_of
+    )
+
+
+def _department_units_by_batch(db: Session, pharmacy_id: int) -> dict[tuple[int, str], int]:
+    rows = (
+        db.query(
+            DepartmentInventory.medicine_id,
+            DepartmentInventory.batch_number,
+            func.sum(DepartmentInventory.quantity),
+        )
+        .join(Medicine, DepartmentInventory.medicine_id == Medicine.id)
+        .filter(
+            DepartmentInventory.pharmacy_id == pharmacy_id,
+            Medicine.pharmacy_id == pharmacy_id,
+            DepartmentInventory.quantity > 0,
+        )
+        .group_by(DepartmentInventory.medicine_id, DepartmentInventory.batch_number)
+        .all()
+    )
+    return {(medicine_id, batch_number): int(quantity) for medicine_id, batch_number, quantity in rows}
 
 
 def _record_activity(
@@ -311,23 +347,47 @@ def dashboard_summary(
 ) -> DashboardSummary:
     medicines = _tenant_medicines(db, current_user).count()
     batches = db.query(BatchStock).join(Medicine).filter(Medicine.pharmacy_id == current_user.pharmacy_id).count()
-    total_units = db.query(func.coalesce(func.sum(BatchStock.quantity), 0)).join(Medicine).filter(Medicine.pharmacy_id == current_user.pharmacy_id).scalar() or 0
+    today = date.today()
+    total_units = (
+        db.query(func.coalesce(func.sum(BatchStock.quantity), 0))
+        .join(Medicine)
+        .filter(
+            Medicine.pharmacy_id == current_user.pharmacy_id,
+            Medicine.active.is_(True),
+            BatchStock.disposal_status == "active",
+            BatchStock.expiry_date >= today,
+        )
+        .scalar()
+        or 0
+    )
+    department_units_by_batch = _department_units_by_batch(db, current_user.pharmacy_id)
+    department_units = 0
     low_stock_items = 0
     near_expiry_batches = 0
 
-    today = date.today()
     for medicine in _tenant_medicines(db, current_user).options(joinedload(Medicine.batches)).all():
-        stock = sum(batch.quantity for batch in medicine.batches if batch.disposal_status == "active")
+        stock = _available_units(medicine, today, department_units_by_batch)
         # A reorder level is a planning target. A low-stock safety alert is only
         # raised when the medicine has five or fewer usable units remaining.
-        if stock <= 5:
+        if medicine.active and stock <= 5:
             low_stock_items += 1
-        near_expiry_batches += sum(
-            1 for batch in medicine.batches if batch.expiry_date <= today + timedelta(days=settings.near_expiry_days)
-        )
+        for batch in medicine.batches:
+            department_quantity = department_units_by_batch.get((medicine.id, batch.batch_number), 0)
+            if medicine.active and batch.disposal_status == "active" and batch.expiry_date >= today:
+                department_units += department_quantity
+            if (
+                batch.disposal_status == "active"
+                and medicine.active
+                and batch.quantity + department_quantity > 0
+                and today <= batch.expiry_date <= today + timedelta(days=settings.near_expiry_days)
+            ):
+                near_expiry_batches += 1
+    total_units += department_units
 
     monthly_consumption = (
         db.query(func.coalesce(func.sum(ConsumptionRecord.quantity), 0))
+        .join(Medicine, ConsumptionRecord.medicine_id == Medicine.id)
+        .filter(Medicine.pharmacy_id == current_user.pharmacy_id)
         .filter(ConsumptionRecord.consumed_on >= today - timedelta(days=30))
         .scalar()
         or 0
@@ -354,8 +414,8 @@ def dashboard_insights(
         total_medicines=_tenant_medicines(db, current_user).count(),
         total_batches=db.query(BatchStock).join(Medicine).filter(Medicine.pharmacy_id == current_user.pharmacy_id).count(),
         total_suppliers=db.query(Supplier).count(),
-        total_transactions=db.query(InventoryTransaction).count(),
-        total_purchase_orders=db.query(PurchaseOrder).count(),
+        total_transactions=db.query(InventoryTransaction).join(Medicine).filter(Medicine.pharmacy_id == current_user.pharmacy_id).count(),
+        total_purchase_orders=db.query(PurchaseOrder).filter(PurchaseOrder.pharmacy_id == current_user.pharmacy_id).count(),
         total_departments=db.query(HospitalDepartment).count(),
         total_locations=db.query(StorageLocation).count(),
     )
@@ -429,6 +489,20 @@ def delete_medicine(
     medicine = _tenant_medicines(db, current_user).filter(Medicine.id == medicine_id).first()
     if not medicine:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Medicine not found")
+    has_batches = db.query(BatchStock.id).filter(BatchStock.medicine_id == medicine_id).first()
+    has_transactions = db.query(InventoryTransaction.id).filter(InventoryTransaction.medicine_id == medicine_id).first()
+    has_department_stock = db.query(DepartmentInventory.id).filter(
+        DepartmentInventory.medicine_id == medicine_id,
+        DepartmentInventory.quantity > 0,
+    ).first()
+    has_consumption = db.query(ConsumptionRecord.id).filter(ConsumptionRecord.medicine_id == medicine_id).first()
+    has_sales = db.query(SaleInvoice.id).filter(SaleInvoice.sku == medicine.sku).first()
+    has_sale_lines = db.query(SaleInvoiceLine.id).filter(SaleInvoiceLine.medicine_id == medicine_id).first()
+    if any((has_batches, has_transactions, has_department_stock, has_consumption, has_sales, has_sale_lines)):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This medicine has stock or transaction history and cannot be deleted. Deactivate it instead.",
+        )
     db.delete(medicine)
     _record_activity(db, current_user, "medicine_deleted", "medicine", medicine.id, f"Deleted medicine {medicine.name} ({medicine.sku})")
     db.commit()
@@ -468,9 +542,13 @@ async def import_medicines(
             if medicine:
                 for field, value in values.items(): setattr(medicine, field, value)
                 updated += 1
+                _record_activity(db, current_user, "medicine_imported", "medicine", medicine.id, f"Updated medicine {medicine.name} ({medicine.sku}) from CSV")
             else:
-                db.add(Medicine(**values, pharmacy_id=current_user.pharmacy_id))
+                medicine = Medicine(**values, pharmacy_id=current_user.pharmacy_id)
+                db.add(medicine)
+                db.flush()
                 created += 1
+                _record_activity(db, current_user, "medicine_imported", "medicine", medicine.id, f"Added medicine {medicine.name} ({medicine.sku}) from CSV")
         except ValueError:
             skipped += 1
             errors.append(f"Line {line}: reorder_level and ideal_stock must be whole numbers")
@@ -620,7 +698,11 @@ def list_transactions(
 
 @router.get("/department-inventory", response_model=list[DepartmentInventoryRead])
 def list_department_inventory(db: Session = Depends(get_db), current_user: User = Depends(require_roles("admin", "pharmacist"))) -> list[DepartmentInventoryRead]:
-    rows = db.query(DepartmentInventory, Medicine.name).join(Medicine, DepartmentInventory.medicine_id == Medicine.id).filter(DepartmentInventory.pharmacy_id == current_user.pharmacy_id, DepartmentInventory.quantity > 0).order_by(DepartmentInventory.department, Medicine.name).all()
+    rows = db.query(DepartmentInventory, Medicine.name).join(Medicine, DepartmentInventory.medicine_id == Medicine.id).filter(
+        DepartmentInventory.pharmacy_id == current_user.pharmacy_id,
+        Medicine.pharmacy_id == current_user.pharmacy_id,
+        DepartmentInventory.quantity > 0,
+    ).order_by(DepartmentInventory.department, Medicine.name).all()
     return [DepartmentInventoryRead(id=item.id, department=item.department, medicine_id=item.medicine_id, medicine_name=name, batch_number=item.batch_number, quantity=item.quantity, updated_at=item.updated_at) for item, name in rows]
 
 
@@ -633,6 +715,12 @@ def use_department_inventory(
     medicine = _tenant_medicines(db, current_user).filter(Medicine.id == payload.medicine_id).first()
     if not medicine:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Medicine not found")
+    batch = db.query(BatchStock).filter(
+        BatchStock.medicine_id == medicine.id,
+        BatchStock.batch_number == payload.batch_number,
+    ).first()
+    if not batch or batch.disposal_status != "active" or batch.expiry_date < date.today():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Expired or quarantined batch stock cannot be used")
     stock = (
         db.query(DepartmentInventory)
         .filter(
@@ -858,9 +946,26 @@ def create_batch(
     medicine = _tenant_medicines(db, current_user).filter(Medicine.id == payload.medicine_id).first()
     if not medicine:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Medicine not found")
+    if not medicine.active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Activate this medicine before receiving a batch")
+    if payload.quantity <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A received batch must contain at least one unit")
+    if db.query(BatchStock.id).filter(
+        BatchStock.medicine_id == payload.medicine_id,
+        BatchStock.batch_number == payload.batch_number,
+    ).first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This batch number already exists for the selected medicine")
     batch = BatchStock(**payload.model_dump())
     db.add(batch)
     db.flush()
+    db.add(InventoryTransaction(
+        transaction_date=batch.received_on,
+        medicine_id=medicine.id,
+        transaction_type="Receipt",
+        quantity=batch.quantity,
+        reference=batch.batch_number,
+        note=f"Received batch {batch.batch_number} from {batch.supplier} into {batch.location}",
+    ))
     _record_activity(db, current_user, "batch_added", "batch", batch.id, f"Added batch {batch.batch_number} for {medicine.name}")
     db.commit()
     db.refresh(batch)
@@ -900,9 +1005,34 @@ def update_batch(
         medicine = _tenant_medicines(db, current_user).filter(Medicine.id == update_data["medicine_id"]).first()
         if not medicine:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Medicine not found")
+        if update_data["medicine_id"] != batch.medicine_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A batch cannot be reassigned to another medicine. Create a new batch for that medicine instead.",
+            )
+    if "batch_number" in update_data and update_data["batch_number"] != batch.batch_number:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A batch number is a traceability identifier and cannot be changed after receipt.",
+        )
 
+    received_on = update_data.get("received_on", batch.received_on)
+    expiry_date = update_data.get("expiry_date", batch.expiry_date)
+    if expiry_date <= received_on:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Expiry date must be after the received date")
+    previous_quantity = batch.quantity
     for field, value in update_data.items():
         setattr(batch, field, value)
+    if batch.quantity != previous_quantity:
+        difference = batch.quantity - previous_quantity
+        db.add(InventoryTransaction(
+            transaction_date=date.today(),
+            medicine_id=batch.medicine_id,
+            transaction_type="Stock increase" if difference > 0 else "Stock decrease",
+            quantity=abs(difference),
+            reference=batch.batch_number,
+            note=f"Batch quantity adjusted from {previous_quantity} to {batch.quantity}",
+        ))
     _record_activity(db, current_user, "batch_updated", "batch", batch.id, f"Updated batch {batch.batch_number}")
     db.commit()
     db.refresh(batch)
@@ -936,6 +1066,37 @@ def delete_batch(
     batch = db.query(BatchStock).join(Medicine).filter(BatchStock.id == batch_id, Medicine.pharmacy_id == current_user.pharmacy_id).first()
     if not batch:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
+    department_stock = db.query(DepartmentInventory).filter(
+        DepartmentInventory.pharmacy_id == current_user.pharmacy_id,
+        DepartmentInventory.medicine_id == batch.medicine_id,
+        DepartmentInventory.batch_number == batch.batch_number,
+        DepartmentInventory.quantity > 0,
+    ).first()
+    if department_stock:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This batch still has units in department stock. Reconcile those units before deleting it.",
+        )
+    if batch.disposal_status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A batch with a disposal or collection record cannot be deleted.",
+        )
+    if batch.quantity > 0:
+        db.add(InventoryTransaction(
+            transaction_date=date.today(),
+            medicine_id=batch.medicine_id,
+            transaction_type="Stock decrease",
+            quantity=batch.quantity,
+            reference=batch.batch_number,
+            note=f"Removed remaining {batch.quantity} units when batch {batch.batch_number} was deleted",
+        ))
+    db.query(DepartmentInventory).filter(
+        DepartmentInventory.pharmacy_id == current_user.pharmacy_id,
+        DepartmentInventory.medicine_id == batch.medicine_id,
+        DepartmentInventory.batch_number == batch.batch_number,
+        DepartmentInventory.quantity <= 0,
+    ).delete(synchronize_session=False)
     db.delete(batch)
     _record_activity(db, current_user, "batch_deleted", "batch", batch.id, f"Deleted batch {batch.batch_number}")
     db.commit()
@@ -980,11 +1141,26 @@ def confirm_expiry_collection(
         raise HTTPException(status_code=404, detail="Batch not found")
     if batch.disposal_status != "collection_requested":
         raise HTTPException(status_code=409, detail="Request collection before confirming handover")
+    department_stocks = (
+        db.query(DepartmentInventory)
+        .filter(
+            DepartmentInventory.pharmacy_id == current_user.pharmacy_id,
+            DepartmentInventory.medicine_id == batch.medicine_id,
+            DepartmentInventory.batch_number == batch.batch_number,
+            DepartmentInventory.quantity > 0,
+        )
+        .with_for_update()
+        .all()
+    )
+    department_quantity = sum(item.quantity for item in department_stocks)
+    for item in department_stocks:
+        item.quantity = 0
     batch.disposal_status = "disposed"
     batch.disposal_reference = payload.handover_reference.strip()
     batch.disposed_on = date.today()
-    db.add(InventoryTransaction(transaction_date=date.today(), medicine_id=batch.medicine_id, transaction_type="Expiry disposal", quantity=batch.quantity, reference=batch.disposal_reference, note=payload.note or f"Collected through {batch.disposal_method}"))
-    db.add(AuditLog(actor_username=current_user.username, pharmacy_id=current_user.pharmacy_id, action="expired_stock_collected", entity_name="batch", entity_id=batch.id, description=f"{batch.batch_number}: collected through {batch.disposal_method}; manifest {batch.disposal_reference}"))
+    disposed_quantity = batch.quantity + department_quantity
+    db.add(InventoryTransaction(transaction_date=date.today(), medicine_id=batch.medicine_id, transaction_type="Expiry disposal", quantity=disposed_quantity, reference=batch.disposal_reference, note=payload.note or f"Collected through {batch.disposal_method}; {department_quantity} units were in department stock"))
+    db.add(AuditLog(actor_username=current_user.username, pharmacy_id=current_user.pharmacy_id, action="expired_stock_collected", entity_name="batch", entity_id=batch.id, description=f"{batch.batch_number}: collected {disposed_quantity} units through {batch.disposal_method}; manifest {batch.disposal_reference}"))
     db.commit()
     medicine = _tenant_medicines(db, current_user).filter(Medicine.id == batch.medicine_id).first()
     return BatchRead(id=batch.id, medicine_id=batch.medicine_id, batch_number=batch.batch_number, supplier=batch.supplier, quantity=batch.quantity, unit_price=batch.unit_price, recovery_unit_price=batch.recovery_unit_price, received_on=batch.received_on, expiry_date=batch.expiry_date, location=batch.location, medicine_name=medicine.name if medicine else None, disposal_status=batch.disposal_status, disposal_method=batch.disposal_method, disposal_reference=batch.disposal_reference, disposed_on=batch.disposed_on, created_at=datetime.combine(batch.received_on, datetime.min.time()))
@@ -1084,19 +1260,22 @@ def dispense_fefo(
     medicine = _tenant_medicines(db, current_user).filter(
         (Medicine.sku == lookup) | (func.lower(Medicine.name) == lookup.lower())
     ).first()
-    query = db.query(BatchStock).join(Medicine).filter(Medicine.pharmacy_id == current_user.pharmacy_id, BatchStock.quantity > 0, BatchStock.expiry_date >= date.today(), BatchStock.disposal_status == "active")
+    if medicine and not medicine.active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This medicine is inactive and cannot be dispensed")
+    query = db.query(BatchStock).join(Medicine).filter(Medicine.pharmacy_id == current_user.pharmacy_id, Medicine.active.is_(True), BatchStock.quantity > 0, BatchStock.expiry_date >= date.today(), BatchStock.disposal_status == "active")
     if medicine:
         query = query.filter(BatchStock.medicine_id == medicine.id)
     else:
         query = query.filter(BatchStock.batch_number == lookup)
-    batches = query.order_by(BatchStock.expiry_date.asc()).with_for_update().all()
+    batches = query.order_by(BatchStock.expiry_date.asc(), BatchStock.id.asc()).with_for_update().all()
     if not batches:
         raise HTTPException(status_code=404, detail="No usable batch found for this barcode, SKU, or batch number")
     available_quantity = sum(item.quantity for item in batches)
     if available_quantity < payload.quantity:
         raise HTTPException(status_code=400, detail=f"Only {available_quantity} units are available for this medicine")
     medicine = _tenant_medicines(db, current_user).filter(Medicine.id == batches[0].medicine_id).first()
-    previous_total = available_quantity
+    department_units_by_batch = _department_units_by_batch(db, current_user.pharmacy_id)
+    previous_total = _available_units(medicine, department_units_by_batch=department_units_by_batch) if medicine else available_quantity
     remaining = payload.quantity
     consumed_batches: list[str] = []
     last_batch = batches[0]
@@ -1137,11 +1316,17 @@ def dispense_fefo(
     except Exception:
         db.rollback()
     if medicine:
-        _notify_critical_stock(db=db, medicine=medicine, previous_total=previous_total, current_total=sum(item.quantity for item in medicine.batches))
+        department_units_by_batch = _department_units_by_batch(db, current_user.pharmacy_id)
+        _notify_critical_stock(
+            db=db,
+            medicine=medicine,
+            previous_total=previous_total,
+            current_total=_available_units(medicine, department_units_by_batch=department_units_by_batch),
+        )
     medicine_name = db.query(Medicine.name).filter(Medicine.id == last_batch.medicine_id).scalar()
     return BatchRead(id=last_batch.id, medicine_id=last_batch.medicine_id, batch_number=last_batch.batch_number, supplier=last_batch.supplier,
         quantity=last_batch.quantity, unit_price=last_batch.unit_price, recovery_unit_price=last_batch.recovery_unit_price, received_on=last_batch.received_on, expiry_date=last_batch.expiry_date, location=last_batch.location, medicine_name=medicine_name,
-        disposal_status=last_batch.disposal_status, disposal_method=last_batch.disposal_method, disposal_reference=last_batch.disposal_reference, disposed_on=last_batch.disposed_on, created_at=datetime.combine(last_batch.received_on, datetime.min.time()))
+        disposal_status=last_batch.disposal_status, disposal_method=last_batch.disposal_method, disposal_reference=last_batch.disposal_reference, disposed_on=last_batch.disposed_on, created_at=datetime.combine(last_batch.received_on, datetime.min.time()), available_quantity=_available_units(medicine) if medicine else 0)
 
 
 @router.post("/sales", response_model=SaleInvoiceRead, status_code=status.HTTP_201_CREATED)
@@ -1151,56 +1336,182 @@ def sell_medicine(
     current_user: User = Depends(require_roles("admin", "pharmacist")),
 ) -> SaleInvoiceRead:
     """Sell FEFO stock and return an itemised pharmacy bill."""
-    if payload.quantity <= 0:
-        raise HTTPException(status_code=400, detail="Quantity must be positive")
-    lookup = payload.lookup.strip()
-    medicine = _tenant_medicines(db, current_user).filter(
-        (Medicine.sku == lookup) | (func.lower(Medicine.name) == lookup.lower())
-    ).first()
-    query = db.query(BatchStock).join(Medicine).filter(Medicine.pharmacy_id == current_user.pharmacy_id, BatchStock.quantity > 0, BatchStock.expiry_date >= date.today(), BatchStock.disposal_status == "active")
-    if medicine:
-        query = query.filter(BatchStock.medicine_id == medicine.id)
+    customer = None
+    if payload.customer_id is not None:
+        customer = db.query(Customer).filter(
+            Customer.id == payload.customer_id,
+            Customer.pharmacy_id == current_user.pharmacy_id,
+            Customer.active.is_(True),
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found in this pharmacy")
+    if payload.items is not None:
+        requested_items = payload.items
+    elif payload.lookup is not None and payload.quantity is not None:
+        requested_items = [SaleLineCreate(lookup=payload.lookup, quantity=payload.quantity)]
     else:
-        query = query.filter(BatchStock.batch_number == lookup)
-    batches = query.order_by(BatchStock.expiry_date.asc(), BatchStock.id.asc()).with_for_update().all()
-    if not batches:
-        raise HTTPException(status_code=404, detail="No saleable batch found for this SKU or batch number")
-    medicine = _tenant_medicines(db, current_user).filter(Medicine.id == batches[0].medicine_id).first()
-    total_available = sum(batch.quantity for batch in batches)
-    if not medicine or total_available < payload.quantity:
-        raise HTTPException(status_code=400, detail=f"Only {total_available} units are available for this medicine")
+        raise HTTPException(status_code=422, detail="Provide at least one sale item")
+    prepared_items: list[tuple[Medicine, list[BatchStock], int, int]] = []
+    seen_medicine_ids: set[int] = set()
+    department_units_by_batch = _department_units_by_batch(db, current_user.pharmacy_id)
+    for requested in requested_items:
+        lookup = requested.lookup.strip()
+        medicine = _tenant_medicines(db, current_user).filter(
+            (Medicine.sku == lookup) | (func.lower(Medicine.name) == lookup.lower())
+        ).first()
+        if medicine and not medicine.active:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This medicine is inactive and cannot be sold")
+        query = db.query(BatchStock).join(Medicine).filter(
+            Medicine.pharmacy_id == current_user.pharmacy_id,
+            Medicine.active.is_(True),
+            BatchStock.quantity > 0,
+            BatchStock.expiry_date >= date.today(),
+            BatchStock.disposal_status == "active",
+        )
+        if medicine:
+            query = query.filter(BatchStock.medicine_id == medicine.id)
+        else:
+            query = query.filter(BatchStock.batch_number == lookup)
+        batches = query.order_by(BatchStock.expiry_date.asc(), BatchStock.id.asc()).with_for_update().all()
+        if not batches:
+            raise HTTPException(status_code=404, detail=f"No saleable batch found for {lookup}")
+        medicine = _tenant_medicines(db, current_user).filter(Medicine.id == batches[0].medicine_id).first()
+        total_available = sum(batch.quantity for batch in batches)
+        if not medicine or total_available < requested.quantity:
+            raise HTTPException(status_code=400, detail=f"Only {total_available} units are available for {lookup}")
+        if medicine.id in seen_medicine_ids:
+            raise HTTPException(status_code=400, detail="Add each medicine to the bill only once")
+        seen_medicine_ids.add(medicine.id)
+        previous_total = _available_units(medicine, department_units_by_batch=department_units_by_batch)
+        prepared_items.append((medicine, batches, requested.quantity, previous_total))
 
-    previous_total = sum(item.quantity for item in medicine.batches if item.disposal_status == "active" and item.expiry_date >= date.today())
-    remaining = payload.quantity
-    sale_value = 0.0
-    consumed_batches: list[str] = []
-    for batch in batches:
-        if remaining <= 0:
-            break
-        consumed = min(batch.quantity, remaining)
-        batch.quantity -= consumed
-        remaining -= consumed
-        sale_value += consumed * batch.unit_price
-        consumed_batches.append(f"{batch.batch_number} ({consumed})")
-    total = round(sale_value, 2)
-    average_unit_price = round(total / payload.quantity, 2)
+    invoice_number = f"SAL-{datetime.utcnow():%Y%m%d%H%M%S%f}"
+    buyer_name = customer.name if customer else payload.buyer_name.strip()
+    buyer_phone = customer.phone if customer else payload.buyer_phone.strip() if payload.buyer_phone else None
+    invoice_line_values: list[dict[str, Any]] = []
+    transactions: list[InventoryTransaction] = []
+    consumption_records: list[ConsumptionRecord] = []
+    total = 0.0
+    total_quantity = 0
+    for medicine, batches, requested_quantity, _ in prepared_items:
+        remaining = requested_quantity
+        line_total = 0.0
+        consumed_batches: list[str] = []
+        for batch in batches:
+            if remaining <= 0:
+                break
+            consumed = min(batch.quantity, remaining)
+            batch.quantity -= consumed
+            remaining -= consumed
+            line_total += consumed * batch.unit_price
+            consumed_batches.append(f"{batch.batch_number} ({consumed})")
+        line_total = round(line_total, 2)
+        unit_price = round(line_total / requested_quantity, 2)
+        total += line_total
+        total_quantity += requested_quantity
+        invoice_line_values.append({
+            "medicine_id": medicine.id,
+            "medicine_name": medicine.name,
+            "sku": medicine.sku,
+            "batch_number": ", ".join(consumed_batches),
+            "quantity": requested_quantity,
+            "unit_price": unit_price,
+            "total_amount": line_total,
+        })
+        transactions.append(InventoryTransaction(
+            transaction_date=date.today(), medicine_id=medicine.id, transaction_type="Sale",
+            quantity=requested_quantity, reference=invoice_number, department=None,
+            note=f"Retail sale to {buyer_name}; FEFO batches: {', '.join(consumed_batches)}",
+        ))
+        consumption_records.append(ConsumptionRecord(
+            medicine_id=medicine.id, consumed_on=date.today(), quantity=requested_quantity, ward="Retail",
+        ))
+    total = round(total, 2)
+    first_line = invoice_line_values[0]
+    invoice_count = len(invoice_line_values)
     invoice = SaleInvoice(
-        invoice_number=f"SAL-{datetime.utcnow():%Y%m%d%H%M%S%f}",
-        buyer_name=payload.buyer_name.strip(), buyer_phone=payload.buyer_phone.strip() if payload.buyer_phone else None,
-        medicine_name=medicine.name, sku=medicine.sku, batch_number=", ".join(consumed_batches),
-        quantity=payload.quantity, unit_price=average_unit_price, total_amount=total, sold_by=current_user.full_name, pharmacy_id=current_user.pharmacy_id,
+        invoice_number=invoice_number,
+        buyer_name=buyer_name,
+        buyer_phone=buyer_phone,
+        medicine_name=first_line["medicine_name"] if invoice_count == 1 else "Multiple items",
+        sku=first_line["sku"] if invoice_count == 1 else "MULTIPLE",
+        batch_number=first_line["batch_number"] if invoice_count == 1 else "Multiple",
+        quantity=total_quantity,
+        unit_price=round(total / total_quantity, 2),
+        total_amount=total, sold_by=current_user.full_name, pharmacy_id=current_user.pharmacy_id,
+        customer_id=customer.id if customer else None,
     )
-    db.add_all([invoice, InventoryTransaction(
-        transaction_date=date.today(), medicine_id=medicine.id, transaction_type="Sale", quantity=payload.quantity,
-        reference=invoice.invoice_number, department=None, note=f"Retail sale to {invoice.buyer_name}; FEFO batches: {', '.join(consumed_batches)}",
-    ), AccountingEntry(
-        pharmacy_id=current_user.pharmacy_id, entry_type="sale", reference=invoice.invoice_number,
-        description=f"Sale of {medicine.name} to {invoice.buyer_name}", debit=total, credit=total,
-    )])
+    db.add(invoice)
+    db.flush()
+    db.add_all([
+        *[
+            SaleInvoiceLine(sale_invoice_id=invoice.id, **line_values)
+            for line_values in invoice_line_values
+        ],
+        *transactions,
+        *consumption_records,
+        AccountingEntry(
+            pharmacy_id=current_user.pharmacy_id, entry_type="sale", reference=invoice.invoice_number,
+            description=f"Sale of {total_quantity} units across {invoice_count} medicine(s) to {buyer_name}",
+            debit=total, credit=total,
+        ),
+    ])
     db.commit()
     db.refresh(invoice)
-    _notify_critical_stock(db=db, medicine=medicine, previous_total=previous_total, current_total=sum(item.quantity for item in medicine.batches))
-    return SaleInvoiceRead.model_validate(invoice)
+    for medicine, _, _, previous_total in prepared_items:
+        department_units_by_batch = _department_units_by_batch(db, current_user.pharmacy_id)
+        _notify_critical_stock(
+            db=db,
+            medicine=medicine,
+            previous_total=previous_total,
+            current_total=_available_units(medicine, department_units_by_batch=department_units_by_batch),
+        )
+    return _sale_invoice_read(db, invoice)
+
+
+def _sale_invoice_read(
+    db: Session,
+    invoice: SaleInvoice,
+    lines: list[SaleInvoiceLine] | None = None,
+) -> SaleInvoiceRead:
+    invoice_lines = lines if lines is not None else db.query(SaleInvoiceLine).filter(
+        SaleInvoiceLine.sale_invoice_id == invoice.id
+    ).order_by(SaleInvoiceLine.id.asc()).all()
+    if not invoice_lines:
+        medicine_id = db.query(Medicine.id).filter(Medicine.sku == invoice.sku).scalar()
+        items = [SaleInvoiceLineRead(
+            medicine_id=medicine_id,
+            medicine_name=invoice.medicine_name,
+            sku=invoice.sku,
+            batch_number=invoice.batch_number,
+            quantity=invoice.quantity,
+            unit_price=invoice.unit_price,
+            total_amount=invoice.total_amount,
+        )]
+    else:
+        items = [SaleInvoiceLineRead.model_validate(line) for line in invoice_lines]
+    return SaleInvoiceRead.model_validate(invoice).model_copy(update={"items": items})
+
+
+@router.get("/sales", response_model=list[SaleInvoiceRead])
+def list_sales(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "pharmacist")),
+) -> list[SaleInvoice]:
+    invoices = db.query(SaleInvoice).filter(
+        SaleInvoice.pharmacy_id == current_user.pharmacy_id
+    ).order_by(SaleInvoice.sold_at.desc()).all()
+    invoice_ids = [invoice.id for invoice in invoices]
+    lines_by_invoice: dict[int, list[SaleInvoiceLine]] = {}
+    if invoice_ids:
+        for line in db.query(SaleInvoiceLine).filter(
+            SaleInvoiceLine.sale_invoice_id.in_(invoice_ids)
+        ).order_by(SaleInvoiceLine.id.asc()).all():
+            lines_by_invoice.setdefault(line.sale_invoice_id, []).append(line)
+    return [
+        _sale_invoice_read(db, invoice, lines_by_invoice.get(invoice.id, []))
+        for invoice in invoices
+    ]
 
 
 @router.get("/alerts", response_model=list[AlertRead])
@@ -1243,12 +1554,31 @@ def export_inventory_csv(
 ) -> Response:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["Medicine", "SKU", "Category", "Batch", "Quantity", "Expiry Date", "Reorder Level"])
+    writer.writerow(["Medicine", "SKU", "Category", "Batch", "Quantity", "Expiry Date", "Reorder Level", "Stock Location"])
     for medicine in _tenant_medicines(db, current_user).options(joinedload(Medicine.batches)).all():
+        batches_by_number = {batch.batch_number: batch for batch in medicine.batches}
         for batch in medicine.batches:
             writer.writerow(
-                [medicine.name, medicine.sku, medicine.category, batch.batch_number, batch.quantity, batch.expiry_date.isoformat(), medicine.reorder_level]
+                [medicine.name, medicine.sku, medicine.category, batch.batch_number, batch.quantity, batch.expiry_date.isoformat(), medicine.reorder_level, batch.location]
             )
+        department_rows = db.query(DepartmentInventory).filter(
+            DepartmentInventory.pharmacy_id == current_user.pharmacy_id,
+            DepartmentInventory.medicine_id == medicine.id,
+            DepartmentInventory.quantity > 0,
+        ).all()
+        for stock in department_rows:
+            batch = batches_by_number.get(stock.batch_number)
+            if batch:
+                writer.writerow([
+                    medicine.name,
+                    medicine.sku,
+                    medicine.category,
+                    stock.batch_number,
+                    stock.quantity,
+                    batch.expiry_date.isoformat(),
+                    medicine.reorder_level,
+                    f"Department: {stock.department}",
+                ])
     headers = {"Content-Disposition": 'attachment; filename="inventory-report.csv"'}
     return Response(buffer.getvalue(), media_type="text/csv", headers=headers)
 
@@ -1340,12 +1670,13 @@ def forecast_trend(
 def _build_alerts(db: Session, current_user: User) -> list[AlertRead]:
     alerts: list[AlertRead] = []
     today = date.today()
+    department_units_by_batch = _department_units_by_batch(db, current_user.pharmacy_id)
     medicines = _tenant_medicines(db, current_user).options(joinedload(Medicine.batches)).order_by(Medicine.name.asc()).all()
     for medicine in medicines:
-        stock_total = sum(batch.quantity for batch in medicine.batches if batch.disposal_status == "active" and batch.expiry_date >= today)
+        stock_total = _available_units(medicine, today, department_units_by_batch)
         # Safety policy: low-stock notifications start only when five or fewer
         # usable units remain, regardless of the planning reorder level.
-        if stock_total <= 5:
+        if medicine.active and stock_total <= 5:
             alerts.append(
                 AlertRead(
                     id=len(alerts) + 1,
@@ -1359,10 +1690,11 @@ def _build_alerts(db: Session, current_user: User) -> list[AlertRead]:
                 )
             )
         for batch in medicine.batches:
-            if batch.disposal_status != "active":
+            batch_quantity = batch.quantity + department_units_by_batch.get((medicine.id, batch.batch_number), 0)
+            if batch.disposal_status != "active" or batch_quantity <= 0:
                 continue
             days_left = (batch.expiry_date - today).days
-            if days_left <= settings.near_expiry_days:
+            if 0 <= days_left <= settings.near_expiry_days:
                 severity = "high" if days_left <= 30 else "medium"
                 alerts.append(
                     AlertRead(
@@ -1375,7 +1707,7 @@ def _build_alerts(db: Session, current_user: User) -> list[AlertRead]:
                         severity=severity,
                         message=f"Batch {batch.batch_number} expires in {days_left} days.",
                         due_on=batch.expiry_date,
-                        quantity=batch.quantity,
+                        quantity=batch_quantity,
                     )
                 )
     return alerts

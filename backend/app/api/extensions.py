@@ -122,12 +122,22 @@ def save_tax_profile(payload: TaxProfilePayload, db: Session = Depends(get_db), 
 @router.get("/accounting-summary")
 def accounting_summary(db: Session = Depends(get_db), current_user: User = Depends(require_roles("admin", "pharmacist"))):
     pharmacy_id = current_user.pharmacy_id
-    sales = db.query(func.coalesce(func.sum(SaleInvoice.total_amount), 0)).filter(SaleInvoice.pharmacy_id == pharmacy_id).scalar() or 0
+    invoices = db.query(SaleInvoice).filter(SaleInvoice.pharmacy_id == pharmacy_id).all()
+    sales = sum(invoice.total_amount for invoice in invoices)
     payments = db.query(func.coalesce(func.sum(PaymentRecord.amount), 0)).filter(PaymentRecord.pharmacy_id == pharmacy_id, PaymentRecord.status == "recorded").scalar() or 0
+    allocated = dict(db.query(
+        PaymentRecord.invoice_number,
+        func.sum(PaymentRecord.amount),
+    ).filter(
+        PaymentRecord.pharmacy_id == pharmacy_id,
+        PaymentRecord.status == "recorded",
+        PaymentRecord.invoice_number.is_not(None),
+    ).group_by(PaymentRecord.invoice_number).all())
     debit = db.query(func.coalesce(func.sum(AccountingEntry.debit), 0)).filter(AccountingEntry.pharmacy_id == pharmacy_id).scalar() or 0
     credit = db.query(func.coalesce(func.sum(AccountingEntry.credit), 0)).filter(AccountingEntry.pharmacy_id == pharmacy_id).scalar() or 0
     gst = db.query(func.coalesce(func.sum(AccountingEntry.gst_amount), 0)).filter(AccountingEntry.pharmacy_id == pharmacy_id).scalar() or 0
-    return {"sales_total": sales, "payments_received": payments, "debit_total": debit, "credit_total": credit, "gst_total": gst, "outstanding": round(max(sales - payments, 0), 2)}
+    outstanding = sum(max(invoice.total_amount - (allocated.get(invoice.invoice_number) or 0), 0) for invoice in invoices)
+    return {"sales_total": sales, "payments_received": payments, "debit_total": debit, "credit_total": credit, "gst_total": gst, "outstanding": round(outstanding, 2)}
 
 
 @router.get("/customers", response_model=list[CustomerRead])
@@ -167,6 +177,21 @@ def list_payments(db: Session = Depends(get_db), current_user: User = Depends(re
 
 @router.post("/payments", response_model=PaymentRead, status_code=status.HTTP_201_CREATED)
 def record_payment(payload: PaymentPayload, db: Session = Depends(get_db), current_user: User = Depends(require_roles("admin", "pharmacist"))):
+    if payload.invoice_number:
+        invoice = db.query(SaleInvoice).filter(
+            SaleInvoice.invoice_number == payload.invoice_number,
+            SaleInvoice.pharmacy_id == current_user.pharmacy_id,
+        ).first()
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Invoice not found in this pharmacy")
+        paid = db.query(func.coalesce(func.sum(PaymentRecord.amount), 0)).filter(
+            PaymentRecord.pharmacy_id == current_user.pharmacy_id,
+            PaymentRecord.invoice_number == payload.invoice_number,
+            PaymentRecord.status == "recorded",
+        ).scalar() or 0
+        balance = round(max(invoice.total_amount - paid, 0), 2)
+        if payload.amount > balance:
+            raise HTTPException(status_code=400, detail=f"Payment exceeds invoice balance of {balance:.2f}")
     reference = f"PAY-{current_user.pharmacy_id}-{db.query(PaymentRecord).filter(PaymentRecord.pharmacy_id == current_user.pharmacy_id).count() + 1:06d}"
     payment = PaymentRecord(pharmacy_id=current_user.pharmacy_id, reference=reference, **payload.model_dump())
     db.add(payment)

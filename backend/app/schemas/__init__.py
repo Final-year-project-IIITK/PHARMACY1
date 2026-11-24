@@ -238,6 +238,7 @@ class BatchRead(BaseModel):
     disposal_reference: str | None = None
     disposed_on: date | None = None
     created_at: datetime
+    available_quantity: int | None = None
 
 
 class ActivityRead(BaseModel):
@@ -394,11 +395,39 @@ class DispenseRequest(BaseModel):
     note: str | None = None
 
 
-class SaleCreate(BaseModel):
+class SaleLineCreate(BaseModel):
     lookup: str = Field(min_length=1, max_length=128)
     quantity: int = Field(gt=0, le=1_000_000)
+
+
+class SaleCreate(BaseModel):
+    items: list[SaleLineCreate] | None = Field(default=None, min_length=1, max_length=100)
+    lookup: str | None = Field(default=None, min_length=1, max_length=128)
+    quantity: int | None = Field(default=None, gt=0, le=1_000_000)
     buyer_name: str = Field(min_length=2, max_length=128)
     buyer_phone: str | None = Field(default=None, max_length=24)
+    customer_id: int | None = None
+
+    @model_validator(mode="after")
+    def validate_sale_lines(self) -> "SaleCreate":
+        if self.items is None:
+            if self.lookup is None or self.quantity is None:
+                raise ValueError("Provide either items or a lookup and quantity")
+        elif self.lookup is not None or self.quantity is not None:
+            raise ValueError("Provide items or a lookup and quantity, not both")
+        return self
+
+
+class SaleInvoiceLineRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    medicine_id: int | None = None
+    medicine_name: str
+    sku: str
+    batch_number: str
+    quantity: int
+    unit_price: float
+    total_amount: float
 
 
 class SaleInvoiceRead(BaseModel):
@@ -415,6 +444,8 @@ class SaleInvoiceRead(BaseModel):
     total_amount: float
     sold_by: str
     sold_at: datetime
+    customer_id: int | None = None
+    items: list[SaleInvoiceLineRead] = Field(default_factory=list)
 
 
 class ImportResult(BaseModel):

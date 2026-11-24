@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import time
+
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -16,6 +20,16 @@ from app.services.seed import seed_demo_data
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name, version="1.0.0")
+
+
+@app.middleware("http")
+async def add_response_time_header(request: Request, call_next) -> Response:
+    started_at = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.3f}"
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,6 +95,8 @@ def on_startup() -> None:
         sales_columns = {column["name"] for column in inspect(engine).get_columns("sale_invoices")}
         if "pharmacy_id" not in sales_columns:
             connection.execute(text("ALTER TABLE sale_invoices ADD COLUMN pharmacy_id INTEGER"))
+        if "customer_id" not in sales_columns:
+            connection.execute(text("ALTER TABLE sale_invoices ADD COLUMN customer_id INTEGER"))
         supplier_columns = {column["name"] for column in inspect(engine).get_columns("suppliers")}
         if "waste_vendor" not in supplier_columns:
             connection.execute(text("ALTER TABLE suppliers ADD COLUMN waste_vendor BOOLEAN NOT NULL DEFAULT 0"))

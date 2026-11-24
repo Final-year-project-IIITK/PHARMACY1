@@ -54,3 +54,22 @@ def test_login_rate_limit_blocks_after_five_failures() -> None:
 
     assert getattr(error.value, "status_code", None) == 429
     clear_login_failures(client_key)
+
+
+def test_role_dependency_rejects_cross_role_access() -> None:
+    from app.services.auth import require_roles
+
+    dependency = require_roles("admin")
+    from app.models.entities import User
+
+    pharmacist = User(
+        username="security-pharmacist",
+        full_name="Security Pharmacist",
+        role="pharmacist",
+        password="not-a-real-password",
+        active=True,
+    )
+    with pytest.raises(HTTPException) as error:
+        dependency(pharmacist)
+
+    assert error.value.status_code == 403

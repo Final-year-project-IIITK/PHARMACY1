@@ -47,7 +47,11 @@
     - CSV and PDF inventory reports
     - CSV template columns: `name,sku,category,unit,reorder_level,ideal_stock,description`
 
-## Optional business modules
+    ### Medicine and stock workflow
+
+    A **medicine** is the catalogue record (name, SKU, unit, and stock policy); it does not add physical units by itself. A **batch** is a received lot of that medicine with its supplier, quantity, expiry, price, and storage location. Receiving a batch updates usable stock, FEFO/sales availability, expiry and low-stock alerts, the transaction history, and inventory reports. FEFO dispensing transfers units from pharmacy stock to the selected department, so dashboard totals include them until department use is recorded as consumption for forecasts. Sales also reduce batch stock and are reflected in transactions, consumption totals, and financial summaries. Inventory exports include pharmacy and department locations. Inactive medicines cannot receive, sell, or dispense stock; records with stock or transaction history must be deactivated rather than deleted.
+
+    ## Optional business modules
 
 The project also exposes additive business modules under `/api/v1/extensions`.
 They do not replace the existing inventory, FEFO, expiry, sales, or procurement
@@ -55,8 +59,9 @@ routes:
 
 - `/tax-profile` stores optional GSTIN, legal-name, state-code, and default GST
   rate settings.
-- `/accounting-summary` provides sales, payment, debit, credit, GST, and
-  outstanding summaries.
+- `/accounting-summary` provides sales, payment, debit, credit, recorded GST,
+  and invoice outstanding summaries. Only payments applied to a pharmacy's
+  invoice reduce its outstanding balance; unallocated receipts do not.
 - `/customers` and `/prescriptions` provide synthetic customer/patient and
   prescription records for demonstration.
 - `/payments` records payment method, provider, invoice reference, and status
@@ -67,10 +72,16 @@ routes:
   payment-gateway adapter integration points. These adapters are intentionally
   not connected to external services yet.
 
-These modules are currently intended for synthetic data and staged testing.
+Sales can be linked to a CRM customer, prescriptions can be linked to a
+customer, and payments can be allocated to invoices. Customer purchase and
+prescription counts are shown in the CRM workspace. These modules are currently
+intended for synthetic data and staged testing.
 Production use requires privacy review, verified GST rules, gateway credentials,
 and integration-specific authentication before real patient, customer, or
 payment information is stored.
+
+The GST profile currently stores business identity and a default rate only. It
+does not calculate GST on sale invoices or constitute a GST-compliant invoice.
 
 ## Trusted medicine-data sources and scope
 
@@ -84,7 +95,7 @@ The system never claims that synthetic stock, supplier contact details, prices, 
 
 ## Sales, purchases, and expiry accountability
 
-- **Sales & Billing** produces an itemised bill and records the sale against the current pharmacy.
+- **Sales & Billing** combines multiple medicines into one itemised bill and records the sale against the current pharmacy.
 - **Sales & purchases** shows separate totals and the purchase-order list for the signed-in pharmacy.
 - **Expiry & waste** applies Green/Yellow/Red/Black expiry zones, keeps expired stock out of sale/dispense, supports supplier return requests, and requires a signed handover reference before final disposal is recorded.
 
@@ -109,6 +120,8 @@ The system never claims that synthetic stock, supplier contact details, prices, 
     - Backend: `.\.venv\Scripts\python.exe -m pytest backend/tests`
     - Frontend: `Set-Location frontend; npm test`
     - Frontend build: `Set-Location frontend; npm run build`
+    - API timing: `.\.venv\Scripts\python.exe scripts/evaluate_api_performance.py`
+    - Synthetic forecast validation: `.\.venv\Scripts\python.exe scripts/evaluate_forecast.py`
 
     Backend tests cover health/authentication contracts, validation boundaries, password/token behavior, and the rate-limit contract. Frontend tests cover the expiry-risk classification used by the operations UI. Add endpoint-specific cases alongside new routes before production changes.
 

@@ -142,6 +142,7 @@ type Batch = {
     disposal_method?: string | null;
     disposal_reference?: string | null;
     disposed_on?: string | null;
+    available_quantity?: number | null;
     created_at: string;
 };
 type Activity = { id: number; action_time: string; action: string; entity_name: string; entity_id: number; description: string };
@@ -197,6 +198,54 @@ type SaleInvoice = {
     total_amount: number;
     sold_by: string;
     sold_at: string;
+    customer_id?: number | null;
+    items: SaleInvoiceLine[];
+};
+
+type SaleInvoiceLine = {
+    medicine_id: number | null;
+    medicine_name: string;
+    sku: string;
+    batch_number: string;
+    quantity: number;
+    unit_price: number;
+    total_amount: number;
+};
+
+function parseInvoiceDate(value: string): Date {
+    const hasTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value);
+    return new Date(hasTimezone ? value : `${value}Z`);
+}
+
+export function splitSaleInvoicesByDay(
+    invoices: SaleInvoice[],
+    now: Date = new Date(),
+): { today: SaleInvoice[]; previous: SaleInvoice[] } {
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const startOfTomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).getTime();
+    const today: SaleInvoice[] = [];
+    const previous: SaleInvoice[] = [];
+
+    invoices.forEach((invoice) => {
+        const soldAt = parseInvoiceDate(invoice.sold_at).getTime();
+        if (soldAt >= startOfToday && soldAt < startOfTomorrow) {
+            today.push(invoice);
+        } else {
+            previous.push(invoice);
+        }
+    });
+
+    return { today, previous };
+}
+
+type SaleCartLine = {
+    medicine_id: number;
+    lookup: string;
+    medicine_name: string;
+    sku: string;
+    quantity: number;
+    unit_price: number;
+    available_quantity: number;
 };
 
 type LoginResponse = {
@@ -347,6 +396,21 @@ export function getExpirySnapshot(expiryDate: string, disposalStatus?: string) {
     return { daysLeft, expiryBand: 'green' as const, expiryLabel: 'Healthy' };
 }
 
+export function filterMedicinesByQuery<T extends Pick<Medicine, 'name' | 'sku' | 'category' | 'description'>>(
+    medicines: T[],
+    query: string,
+): T[] {
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) {
+        return medicines;
+    }
+    return medicines.filter((medicine) =>
+        `${medicine.name} ${medicine.sku} ${medicine.category} ${medicine.description ?? ''}`
+            .toLowerCase()
+            .includes(normalizedQuery),
+    );
+}
+
 export default function App() {
     const [token, setToken] = useState<string | null>(() => localStorage.getItem(TOKEN_KEY));
     const [currentUser, setCurrentUser] = useState<User | null>(() => {
@@ -358,6 +422,7 @@ export default function App() {
     const [authUsername, setAuthUsername] = useState('admin');
     const [authPassword, setAuthPassword] = useState('admin123');
     const [selectedMedicineId, setSelectedMedicineId] = useState<number | null>(null);
+    const [dashboardMedicineSearch, setDashboardMedicineSearch] = useState('');
     const [medicineSearch, setMedicineSearch] = useState('');
     const [batchSearch, setBatchSearch] = useState('');
     const [activeTab, setActiveTab] = useState<Page>(() => {
@@ -400,6 +465,7 @@ export default function App() {
     const [salePrice, setSalePrice] = useState('0');
     const [saleSearch, setSaleSearch] = useState('');
     const [selectedSaleBatchId, setSelectedSaleBatchId] = useState<number | null>(null);
+    const [saleCart, setSaleCart] = useState<SaleCartLine[]>([]);
     const [buyerName, setBuyerName] = useState('');
     const [buyerPhone, setBuyerPhone] = useState('');
     const [latestBill, setLatestBill] = useState<SaleInvoice | null>(null);
@@ -409,8 +475,12 @@ export default function App() {
     const [customers, setCustomers] = useState<Customer[]>([]);
     const [prescriptions, setPrescriptions] = useState<Prescription[]>([]);
     const [payments, setPayments] = useState<PaymentRecord[]>([]);
+    const [saleInvoices, setSaleInvoices] = useState<SaleInvoice[]>([]);
     const [exchangeListings, setExchangeListings] = useState<ExchangeListing[]>([]);
-    const [businessForm, setBusinessForm] = useState({ gstin: '', legal_name: '', default_gst_rate: '0', state_code: '', customer_name: '', customer_phone: '', patient_name: '', doctor_name: '', prescription_number: '', medicine_summary: '', payment_amount: '', payment_method: 'cash', exchange_medicine_id: '', exchange_quantity: '1' });
+    const [businessForm, setBusinessForm] = useState({ gstin: '', legal_name: '', default_gst_rate: '0', state_code: '', customer_name: '', customer_phone: '', customer_email: '', patient_name: '', doctor_name: '', prescription_number: '', medicine_summary: '', prescription_customer_id: '', payment_amount: '', payment_method: 'cash', payment_invoice_number: '', exchange_medicine_id: '', exchange_quantity: '1' });
+    const [saleCustomerId, setSaleCustomerId] = useState('');
+    const [customerSearch, setCustomerSearch] = useState('');
+    const [prescriptionSearch, setPrescriptionSearch] = useState('');
     const [pharmacies, setPharmacies] = useState<Pharmacy[]>([]);
     const [platformUsers, setPlatformUsers] = useState<User[]>([]);
     const [platformPharmacyForm, setPlatformPharmacyForm] = useState({ id: 0, name: '', hospital_name: '', licence_number: '', address: '', country: '' });
@@ -508,9 +578,9 @@ export default function App() {
         }
     }
 
-    async function loadWorkspace(medicineId?: number | null, roleOverride?: string) {
+    async function loadWorkspace(medicineId?: number | null, roleOverride?: string): Promise<boolean> {
         if (!token) {
-            return;
+            return false;
         }
         setLoading(true);
         try {
@@ -549,20 +619,29 @@ export default function App() {
             setDepartmentInventory(departmentInventoryData);
             setFinancials(financialSummary);
             try {
-                const [tax, accounting, customerData, prescriptionData, paymentData, exchangeData] = await Promise.all([
+                const [tax, accounting, customerData, prescriptionData, paymentData, exchangeData, salesData] = await Promise.all([
                     apiRequest<TaxProfile | null>('/extensions/tax-profile', token),
                     apiRequest<AccountingSummary>('/extensions/accounting-summary', token),
                     apiRequest<Customer[]>('/extensions/customers', token),
                     apiRequest<Prescription[]>('/extensions/prescriptions', token),
                     apiRequest<PaymentRecord[]>('/extensions/payments', token),
                     apiRequest<ExchangeListing[]>('/extensions/exchange/listings', token),
+                    apiRequest<SaleInvoice[]>('/sales', token),
                 ]);
                 setTaxProfile(tax);
+                setBusinessForm((previous) => ({
+                    ...previous,
+                    gstin: tax?.gstin ?? '',
+                    legal_name: tax?.legal_name ?? '',
+                    default_gst_rate: String(tax?.default_gst_rate ?? 0),
+                    state_code: tax?.state_code ?? '',
+                }));
                 setAccountingSummary(accounting);
                 setCustomers(customerData);
                 setPrescriptions(prescriptionData);
                 setPayments(paymentData);
                 setExchangeListings(exchangeData);
+                setSaleInvoices(salesData);
             } catch (error) {
                 setStatus(error instanceof Error ? `Business modules: ${error.message}` : 'Business modules failed to load');
             }
@@ -588,8 +667,10 @@ export default function App() {
                 setDashboardData((previous) => previous ? { ...previous, forecast: refreshedForecast } : previous);
             }
             setStatus(activityError ?? 'Data refreshed');
+            return true;
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Failed to load workspace');
+            return false;
         } finally {
             setLoading(false);
         }
@@ -597,9 +678,15 @@ export default function App() {
 
     async function saveTaxProfile() {
         if (!token) return;
+        const defaultGstRate = Number(businessForm.default_gst_rate);
+        if (!Number.isFinite(defaultGstRate) || defaultGstRate < 0 || defaultGstRate > 100) {
+            setStatus('Default GST rate must be between 0 and 100');
+            return;
+        }
         try {
-            const profile = await apiRequest<TaxProfile>('/extensions/tax-profile', token, { method: 'PUT', body: JSON.stringify({ gstin: businessForm.gstin || null, legal_name: businessForm.legal_name || null, default_gst_rate: Number(businessForm.default_gst_rate) || 0, state_code: businessForm.state_code || null }) });
+            const profile = await apiRequest<TaxProfile>('/extensions/tax-profile', token, { method: 'PUT', body: JSON.stringify({ gstin: businessForm.gstin || null, legal_name: businessForm.legal_name || null, default_gst_rate: defaultGstRate, state_code: businessForm.state_code || null }) });
             setTaxProfile(profile);
+            setBusinessForm((previous) => ({ ...previous, gstin: profile.gstin ?? '', legal_name: profile.legal_name ?? '', default_gst_rate: String(profile.default_gst_rate), state_code: profile.state_code ?? '' }));
             setStatus('GST profile saved');
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'GST profile save failed');
@@ -609,9 +696,9 @@ export default function App() {
     async function createCustomer() {
         if (!token || !businessForm.customer_name.trim()) return;
         try {
-            const customer = await apiRequest<Customer>('/extensions/customers', token, { method: 'POST', body: JSON.stringify({ name: businessForm.customer_name, phone: businessForm.customer_phone || null }) });
+            const customer = await apiRequest<Customer>('/extensions/customers', token, { method: 'POST', body: JSON.stringify({ name: businessForm.customer_name, phone: businessForm.customer_phone || null, email: businessForm.customer_email || null }) });
             setCustomers((previous) => [customer, ...previous]);
-            setBusinessForm((previous) => ({ ...previous, customer_name: '', customer_phone: '' }));
+            setBusinessForm((previous) => ({ ...previous, customer_name: '', customer_phone: '', customer_email: '' }));
             setStatus('Customer saved');
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Customer save failed');
@@ -621,9 +708,9 @@ export default function App() {
     async function createPrescription() {
         if (!token || !businessForm.patient_name.trim() || !businessForm.prescription_number.trim()) return;
         try {
-            const prescription = await apiRequest<Prescription>('/extensions/prescriptions', token, { method: 'POST', body: JSON.stringify({ patient_name: businessForm.patient_name, doctor_name: businessForm.doctor_name || null, prescription_number: businessForm.prescription_number, medicine_summary: businessForm.medicine_summary, prescribed_on: new Date().toISOString().slice(0, 10) }) });
+            const prescription = await apiRequest<Prescription>('/extensions/prescriptions', token, { method: 'POST', body: JSON.stringify({ patient_name: businessForm.patient_name, doctor_name: businessForm.doctor_name || null, prescription_number: businessForm.prescription_number, medicine_summary: businessForm.medicine_summary, prescribed_on: new Date().toISOString().slice(0, 10), customer_id: businessForm.prescription_customer_id ? Number(businessForm.prescription_customer_id) : null }) });
             setPrescriptions((previous) => [prescription, ...previous]);
-            setBusinessForm((previous) => ({ ...previous, patient_name: '', doctor_name: '', prescription_number: '', medicine_summary: '' }));
+            setBusinessForm((previous) => ({ ...previous, patient_name: '', doctor_name: '', prescription_number: '', medicine_summary: '', prescription_customer_id: '' }));
             setStatus('Prescription saved');
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Prescription save failed');
@@ -633,11 +720,13 @@ export default function App() {
     async function recordPayment() {
         if (!token || Number(businessForm.payment_amount) <= 0) return;
         try {
-            const payment = await apiRequest<PaymentRecord>('/extensions/payments', token, { method: 'POST', body: JSON.stringify({ amount: Number(businessForm.payment_amount), method: businessForm.payment_method }) });
+            const payment = await apiRequest<PaymentRecord>('/extensions/payments', token, { method: 'POST', body: JSON.stringify({ amount: Number(businessForm.payment_amount), method: businessForm.payment_method, invoice_number: businessForm.payment_invoice_number || null }) });
             setPayments((previous) => [payment, ...previous]);
             setBusinessForm((previous) => ({ ...previous, payment_amount: '' }));
             const summary = await apiRequest<AccountingSummary>('/extensions/accounting-summary', token);
             setAccountingSummary(summary);
+            const salesData = await apiRequest<SaleInvoice[]>('/sales', token);
+            setSaleInvoices(salesData);
             setStatus('Payment recorded');
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Payment recording failed');
@@ -849,28 +938,27 @@ export default function App() {
             const response = await fetch(`${API_BASE}/imports/medicines`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body });
             const result = await response.json() as { created?: number; updated?: number; skipped?: number; detail?: string };
             if (!response.ok) throw new Error(result.detail || 'Import failed');
-            setStatus(`Import complete: ${result.created} created, ${result.updated} updated, ${result.skipped} skipped`);
-            setImportFile(null); await loadWorkspace(selectedMedicineId);
+            setImportFile(null);
+            const refreshed = await loadWorkspace(selectedMedicineId);
+            setStatus(refreshed
+                ? `Import complete: ${result.created} created, ${result.updated} updated, ${result.skipped} skipped`
+                : `Import saved, but some views could not refresh. Use Refresh list to reload the workspace.`);
         } catch (error) { setStatus(error instanceof Error ? error.message : 'Import failed'); }
     }
 
-    async function refreshStockViews() {
-        if (!token) return;
-        const [batches, inventory] = await Promise.all([
-            apiRequest<Batch[]>('/batches', token),
-            apiRequest<DepartmentInventory[]>('/department-inventory', token),
-        ]);
-        setDepartmentInventory(inventory);
-        setDashboardData((previous) => previous ? { ...previous, batches } : previous);
+    async function refreshStockViews(): Promise<boolean> {
+        return loadWorkspace(selectedMedicineId);
     }
 
     async function dispenseMedicine() {
         if (!token) return;
         try {
             const batch = await apiRequest<Batch>('/dispense', token, { method: 'POST', body: JSON.stringify({ lookup: dispenseLookup, quantity: Number(dispenseQuantity), department: dispenseDepartment, note: dispenseNote || null }) });
-            setStatus(`Dispensed using FEFO batch ${batch.batch_number}; ${batch.quantity} units remain`);
             setDispenseLookup(''); setDispenseQuantity('1'); setDispenseNote('');
-            await refreshStockViews();
+            const refreshed = await refreshStockViews();
+            setStatus(refreshed
+                ? `Dispensed using FEFO batch ${batch.batch_number}; ${batch.available_quantity ?? batch.quantity} usable units remain across all batches`
+                : `Dispense was recorded, but some views could not refresh. Use Refresh list to reload the workspace.`);
         } catch (error) { setStatus(error instanceof Error ? error.message : 'Dispensing failed'); }
     }
 
@@ -901,8 +989,10 @@ export default function App() {
             setDepartmentInventory((previous) => previous
                 .map((entry) => entry.id === item.id ? { ...entry, quantity: entry.quantity - requestedQuantity, updated_at: new Date().toISOString() } : entry)
                 .filter((entry) => entry.quantity > 0));
-            await refreshStockViews();
-            setStatus(`${requestedQuantity} ${item.medicine_name} units used in ${item.department}; stock updated`);
+            const refreshed = await refreshStockViews();
+            setStatus(refreshed
+                ? `${requestedQuantity} ${item.medicine_name} units used in ${item.department}; stock updated`
+                : `Department use was recorded, but some views could not refresh. Use Refresh list to reload the workspace.`);
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Department stock update failed');
         }
@@ -910,13 +1000,16 @@ export default function App() {
 
     async function sellMedicine() {
         if (!token || !buyerName.trim()) { setStatus('Enter the buyer name before generating the bill'); return; }
-        if (!saleLookup.trim()) { setStatus('Select an available medicine or batch before generating the bill'); return; }
+        if (saleCart.length === 0) { setStatus('Add at least one medicine to the bill'); return; }
         try {
-            const bill = await apiRequest<SaleInvoice>('/sales', token, { method: 'POST', body: JSON.stringify({ lookup: saleLookup, quantity: Number(saleQuantity), buyer_name: buyerName, buyer_phone: buyerPhone || null }) });
+            const bill = await apiRequest<SaleInvoice>('/sales', token, { method: 'POST', body: JSON.stringify({ items: saleCart.map(({ lookup, quantity }) => ({ lookup, quantity })), buyer_name: buyerName, buyer_phone: buyerPhone || null, customer_id: saleCustomerId ? Number(saleCustomerId) : null }) });
             setLatestBill(bill);
-            setSaleLookup(''); setSelectedSaleBatchId(null); setSaleQuantity('1'); setSalePrice('0'); setBuyerName(''); setBuyerPhone('');
-            setStatus(`Bill ${bill.invoice_number} generated`);
-            await loadWorkspace(selectedMedicineId);
+            setSaleCart([]);
+            setSaleLookup(''); setSelectedSaleBatchId(null); setSaleQuantity('1'); setSalePrice('0'); setBuyerName(''); setBuyerPhone(''); setSaleCustomerId('');
+            const refreshed = await loadWorkspace(selectedMedicineId);
+            setStatus(refreshed
+                ? `Bill ${bill.invoice_number} generated`
+                : `Bill ${bill.invoice_number} was generated, but some views could not refresh. Use Refresh list to reload the workspace.`);
         } catch (error) { setStatus(error instanceof Error ? error.message : 'Unable to complete the sale'); }
     }
 
@@ -926,6 +1019,17 @@ export default function App() {
         localStorage.removeItem(TOKEN_KEY);
         localStorage.removeItem(USER_KEY);
         setDashboardData(null);
+        setSaleCart([]);
+        setLatestBill(null);
+        setBuyerName('');
+        setBuyerPhone('');
+        setSaleCustomerId('');
+        setCustomers([]);
+        setPrescriptions([]);
+        setPayments([]);
+        setSaleInvoices([]);
+        setTaxProfile(null);
+        setAccountingSummary(null);
         setStatus('Signed out');
     }
 
@@ -952,11 +1056,13 @@ export default function App() {
             }
             setMedicineForm(emptyMedicineForm);
             setEditingMedicineId(null);
-            await loadWorkspace(savedMedicine.id);
+            const refreshed = await loadWorkspace(savedMedicine.id);
             setSelectedMedicineId(savedMedicine.id);
             setBatchForm((previous) => ({ ...previous, medicine_id: String(savedMedicine.id) }));
             navigate('batches');
-            setStatus(`Medicine saved. Add a received batch for ${savedMedicine.name} to place stock in storage.`);
+            setStatus(refreshed
+                ? `Medicine saved. Add a received batch for ${savedMedicine.name} to place stock in storage.`
+                : `Medicine saved, but some views could not refresh. Use Refresh list before continuing.`);
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Medicine save failed');
         }
@@ -971,8 +1077,8 @@ export default function App() {
             if (selectedMedicineId === id) {
                 setSelectedMedicineId(null);
             }
-            await loadWorkspace();
-            setStatus('Medicine deleted');
+            const refreshed = await loadWorkspace();
+            setStatus(refreshed ? 'Medicine deleted' : 'Medicine deleted, but some views could not refresh. Use Refresh list to reload the workspace.');
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Medicine delete failed');
         }
@@ -988,7 +1094,7 @@ export default function App() {
             supplier: batchForm.supplier,
             quantity: Number(batchForm.quantity),
             unit_price: Number(batchForm.unit_price),
-                recovery_unit_price: Number(batchForm.recovery_unit_price),
+            recovery_unit_price: Number(batchForm.recovery_unit_price),
             received_on: batchForm.received_on,
             expiry_date: batchForm.expiry_date,
             location: batchForm.location,
@@ -999,6 +1105,10 @@ export default function App() {
         }
         if (payload.quantity < 0 || !Number.isInteger(payload.quantity)) {
             setStatus('Quantity must be a whole number zero or greater');
+            return;
+        }
+        if (!editingBatchId && payload.quantity === 0) {
+            setStatus('A received batch must contain at least one unit');
             return;
         }
         const receivedDate = new Date(payload.received_on);
@@ -1017,8 +1127,10 @@ export default function App() {
             setBatchForm(emptyBatchForm);
             setEditingBatchId(null);
             setSelectedMedicineId(savedBatch.medicine_id);
-            await loadWorkspace(savedBatch.medicine_id);
-            setStatus(`Batch ${savedBatch.batch_number} saved in storage location ${savedBatch.location}`);
+            const refreshed = await loadWorkspace(savedBatch.medicine_id);
+            setStatus(refreshed
+                ? `Batch ${savedBatch.batch_number} received in ${savedBatch.location}; stock, transactions, alerts, and reports are refreshed.`
+                : `Batch ${savedBatch.batch_number} was saved, but some views could not refresh. Use Refresh list to reload the workspace.`);
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Batch save failed');
         }
@@ -1030,8 +1142,8 @@ export default function App() {
         }
         try {
             await apiRequest(`/batches/${id}`, token, { method: 'DELETE' });
-            await loadWorkspace(selectedMedicineId);
-            setStatus('Batch deleted');
+            const refreshed = await loadWorkspace(selectedMedicineId);
+            setStatus(refreshed ? 'Batch deleted' : 'Batch deleted, but some views could not refresh. Use Refresh list to reload the workspace.');
         } catch (error) {
             setStatus(error instanceof Error ? error.message : 'Batch delete failed');
         }
@@ -1070,14 +1182,35 @@ export default function App() {
         });
     }
 
+    const medicineById = new Map((dashboardData?.medicines ?? []).map((medicine) => [medicine.id, medicine]));
+    const availableUnitsByMedicine = new Map((dashboardData?.medicines ?? []).map((medicine) => [
+        medicine.id,
+        medicine.active
+            ? (dashboardData?.batches ?? [])
+                .filter((batch) => batch.medicine_id === medicine.id
+                    && batch.disposal_status === 'active'
+                    && new Date(`${batch.expiry_date}T00:00:00`) >= new Date(new Date().toDateString()))
+                .reduce((total, batch) => total + batch.quantity, 0)
+            : 0,
+    ]));
+    const availableDepartmentUnitsByMedicine = new Map((dashboardData?.medicines ?? []).map((medicine) => [
+        medicine.id,
+        medicine.active
+            ? departmentInventory
+                .filter((entry) => entry.medicine_id === medicine.id)
+                .filter((entry) => {
+                    const batch = (dashboardData?.batches ?? []).find((item) => item.medicine_id === entry.medicine_id && item.batch_number === entry.batch_number);
+                    return batch?.disposal_status === 'active' && new Date(`${batch.expiry_date}T00:00:00`) >= new Date(new Date().toDateString());
+                })
+                .reduce((total, entry) => total + entry.quantity, 0)
+            : 0,
+    ]));
     const availableSaleBatches = (dashboardData?.batches ?? [])
-        .filter((batch) => batch.quantity > 0 && batch.disposal_status === 'active' && new Date(`${batch.expiry_date}T00:00:00`) >= new Date(new Date().toDateString()))
+        .filter((batch) => batch.quantity > 0 && batch.disposal_status === 'active' && medicineById.get(batch.medicine_id)?.active === true && new Date(`${batch.expiry_date}T00:00:00`) >= new Date(new Date().toDateString()))
         .slice()
         .sort((left, right) => new Date(left.expiry_date).getTime() - new Date(right.expiry_date).getTime());
-    const filteredMedicines = (dashboardData?.medicines ?? []).filter((medicine) => {
-        const query = medicineSearch.trim().toLowerCase();
-        return !query || `${medicine.name} ${medicine.sku} ${medicine.category} ${medicine.description ?? ''}`.toLowerCase().includes(query);
-    });
+    const filteredMedicines = filterMedicinesByQuery(dashboardData?.medicines ?? [], medicineSearch);
+    const dashboardMedicines = filterMedicinesByQuery(dashboardData?.medicines ?? [], dashboardMedicineSearch);
     const filteredBatches = (dashboardData?.batches ?? []).filter((batch) => {
         const query = batchSearch.trim().toLowerCase();
         return !query || `${batch.medicine_name ?? ''} ${batch.batch_number} ${batch.supplier} ${batch.location} ${batch.expiry_date}`.toLowerCase().includes(query);
@@ -1089,17 +1222,28 @@ export default function App() {
         const matchesSearch = !query || `${transaction.medicine_name ?? ''} ${transaction.reference} ${transaction.department ?? ''} ${transaction.note ?? ''}`.toLowerCase().includes(query);
         return matchesType && matchesSearch;
     });
+    const billHistory = splitSaleInvoicesByDay(saleInvoices);
     const departmentSummaries = departments.map((department) => {
         const stock = departmentInventory.filter((item) => item.department === department.name);
+        const readyStock = stock.filter((item) => {
+            const batch = dashboardData?.batches.find((entry) => entry.medicine_id === item.medicine_id && entry.batch_number === item.batch_number);
+            return batch?.disposal_status === 'active' && new Date(`${batch.expiry_date}T00:00:00`) >= new Date(new Date().toDateString());
+        });
         return {
             ...department,
             stock,
-            medicineCount: new Set(stock.map((item) => item.medicine_id)).size,
-            totalQuantity: stock.reduce((total, item) => total + item.quantity, 0),
+            medicineCount: new Set(readyStock.map((item) => item.medicine_id)).size,
+            totalQuantity: readyStock.reduce((total, item) => total + item.quantity, 0),
         };
     });
     const selectedDepartmentSummary = departmentSummaries.find((department) => department.name === selectedDepartment) ?? departmentSummaries[0];
-    const expiryRows = (dashboardData?.batches ?? []).map((batch) => ({ batch, info: getExpirySnapshot(batch.expiry_date, batch.disposal_status) }));
+    const expiryRows = (dashboardData?.batches ?? []).map((batch) => {
+        const departmentQuantity = departmentInventory
+            .filter((entry) => entry.medicine_id === batch.medicine_id && entry.batch_number === batch.batch_number)
+            .reduce((total, entry) => total + entry.quantity, 0);
+        const batchAtAllLocations = { ...batch, quantity: batch.quantity + departmentQuantity };
+        return { batch: batchAtAllLocations, info: getExpirySnapshot(batch.expiry_date, batch.disposal_status) };
+    });
     const expiryFilteredRows = expiryRows.filter(({ batch, info }) => {
         const query = expirySearch.trim().toLowerCase();
         const matchesSearch = !query || `${batch.medicine_name ?? ''} ${batch.batch_number} ${batch.supplier} ${batch.location}`.toLowerCase().includes(query);
@@ -1111,7 +1255,6 @@ export default function App() {
     const expiryRiskQuantity = expiryAtRisk.reduce((total, { batch }) => total + batch.quantity, 0);
     const expiryRiskValue = expiryAtRisk.reduce((total, { batch }) => total + batch.quantity * batch.unit_price, 0);
 
-    const medicineById = new Map((dashboardData?.medicines ?? []).map((medicine) => [medicine.id, medicine]));
     const saleBatchIndex = new Map(availableSaleBatches.map((batch) => [batch.id, batch]));
     const selectedSaleBatch = saleBatchIndex.get(selectedSaleBatchId ?? -1) ?? availableSaleBatches.find((batch) => batch.batch_number === saleLookup) ?? null;
 
@@ -1149,7 +1292,7 @@ export default function App() {
         .sort((left, right) => left.medicineName.localeCompare(right.medicineName));
 
     const fefoQueue = (dashboardData?.batches ?? [])
-        .filter((batch) => batch.quantity > 0 && batch.disposal_status === 'active' && new Date(`${batch.expiry_date}T00:00:00`) >= new Date(new Date().toDateString()))
+        .filter((batch) => batch.quantity > 0 && batch.disposal_status === 'active' && medicineById.get(batch.medicine_id)?.active === true && new Date(`${batch.expiry_date}T00:00:00`) >= new Date(new Date().toDateString()))
         .slice()
         .sort((left, right) => new Date(left.expiry_date).getTime() - new Date(right.expiry_date).getTime());
     const filteredFefoQueue = fefoQueue.filter((batch) => {
@@ -1173,6 +1316,42 @@ export default function App() {
         setSaleLookup(medicineEntry.medicineSku || medicineEntry.nextBatch.batch_number);
         setSalePrice(String(medicineEntry.nextBatch.unit_price));
         setStatus(`${medicineEntry.medicineName} selected; FEFO will consume earliest valid batches`);
+    }
+
+    function addSaleToCart() {
+        if (!selectedSaleBatch || !saleLookup.trim()) {
+            setStatus('Select an available medicine before adding it to the bill');
+            return;
+        }
+        const quantity = Number(saleQuantity);
+        if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+            setStatus('Enter a whole-number quantity greater than zero');
+            return;
+        }
+        const medicine = medicineById.get(selectedSaleBatch.medicine_id);
+        const availableQuantity = availableSaleBatches
+            .filter((batch) => batch.medicine_id === selectedSaleBatch.medicine_id)
+            .reduce((total, batch) => total + batch.quantity, 0);
+        const existing = saleCart.find((line) => line.medicine_id === selectedSaleBatch.medicine_id);
+        const combinedQuantity = quantity + (existing?.quantity ?? 0);
+        if (combinedQuantity > availableQuantity) {
+            setStatus(`Only ${availableQuantity} units of ${selectedSaleBatch.medicine_name} are available`);
+            return;
+        }
+        const line: SaleCartLine = {
+            medicine_id: selectedSaleBatch.medicine_id,
+            lookup: medicine?.sku ?? selectedSaleBatch.batch_number,
+            medicine_name: selectedSaleBatch.medicine_name ?? medicine?.name ?? 'Unknown medicine',
+            sku: medicine?.sku ?? '',
+            quantity: combinedQuantity,
+            unit_price: selectedSaleBatch.unit_price,
+            available_quantity: availableQuantity,
+        };
+        setSaleCart((previous) => existing
+            ? previous.map((entry) => entry.medicine_id === line.medicine_id ? line : entry)
+            : [...previous, line]);
+        setSaleQuantity('1');
+        setStatus(`${line.medicine_name} added to bill`);
     }
 
     const canEdit = currentUser?.role === 'admin' || currentUser?.role === 'pharmacist';
@@ -1356,11 +1535,24 @@ export default function App() {
                                 <div className="panel-header">
                                     <div>
                                         <div className="section-title">Medicines</div>
-                                        <h3>Catalogue and reorder levels</h3>
+                                        <h3>Catalogue and usable stock</h3>
                                     </div>
                                 </div>
                                 <div className="list-box">
-                                    {dashboardData.medicines.map((medicine) => (
+                                    <div className="table-toolbar">
+                                        <input
+                                            type="search"
+                                            aria-label="Search dashboard medicines"
+                                            placeholder="Search name, SKU, category, or description..."
+                                            value={dashboardMedicineSearch}
+                                            onChange={(event) => setDashboardMedicineSearch(event.target.value)}
+                                        />
+                                        {dashboardMedicineSearch && (
+                                            <button className="secondary inline" onClick={() => setDashboardMedicineSearch('')}>Clear</button>
+                                        )}
+                                        <small>{dashboardMedicines.length} of {dashboardData.medicines.length} medicines</small>
+                                    </div>
+                                    {dashboardMedicines.map((medicine) => (
                                         <button
                                             key={medicine.id}
                                             className={medicine.id === selectedMedicineId ? 'medicine-row active' : 'medicine-row'}
@@ -1368,11 +1560,17 @@ export default function App() {
                                         >
                                             <span>
                                                 <strong>{medicine.name}</strong>
-                                                <small>{medicine.category} · SKU {medicine.sku}</small>
+                                                <small>{medicine.category} · SKU {medicine.sku}{medicine.active ? '' : ' · Inactive'}</small>
                                             </span>
-                                            <span>{medicine.reorder_level} min</span>
+                                            <span>
+                                                <strong>{(availableUnitsByMedicine.get(medicine.id) ?? 0) + (availableDepartmentUnitsByMedicine.get(medicine.id) ?? 0)} {medicine.unit} total</strong>
+                                                <small>{medicine.reorder_level} reorder · {availableUnitsByMedicine.get(medicine.id) ?? 0} pharmacy / {availableDepartmentUnitsByMedicine.get(medicine.id) ?? 0} department</small>
+                                            </span>
                                         </button>
                                     ))}
+                                    {!dashboardMedicines.length && (
+                                        <div className="empty-state">No medicines match “{dashboardMedicineSearch}”. Try another name, SKU, or category.</div>
+                                    )}
                                 </div>
                             </div>}
                         </section>
@@ -1478,7 +1676,7 @@ export default function App() {
                                 <div>
                                     <div className="section-title">Medicine CRUD</div>
                                     <h3>{editingMedicineId ? 'Edit medicine' : 'Create medicine'}</h3>
-                                    {!editingMedicineId && <p className="muted">Add the medicine catalogue record here first. Then open Batches to add stock for it.</p>}
+                                    {!editingMedicineId && <p className="muted">A medicine is the catalogue item (name, SKU, and unit). To make it available in stock, receive one or more batches on the Batches page.</p>}
                                 </div>
                                 <div className="recommendation">{canEdit ? 'Editable' : 'Read only'}</div>
                             </div>
@@ -1527,6 +1725,8 @@ export default function App() {
                                         <th>SKU</th>
                                         <th>Category</th>
                                         <th>Reorder</th>
+                                        <th>Usable stock</th>
+                                        <th>Status</th>
                                         <th>Actions</th>
                                     </tr>
                                 </thead>
@@ -1537,6 +1737,8 @@ export default function App() {
                                             <td>{medicine.sku}</td>
                                             <td>{medicine.category}</td>
                                             <td>{medicine.reorder_level}</td>
+                                            <td>{availableUnitsByMedicine.get(medicine.id) ?? 0} pharmacy + {availableDepartmentUnitsByMedicine.get(medicine.id) ?? 0} department {medicine.unit} · {dashboardData.batches.filter((batch) => batch.medicine_id === medicine.id).length} batches</td>
+                                            <td>{medicine.active ? 'Active' : 'Inactive'}</td>
                                             <td>
                                                 <div className="table-actions">
                                                     <button className="ghost" onClick={() => startMedicineEdit(medicine)} disabled={!canEdit}>Edit</button>
@@ -1545,7 +1747,7 @@ export default function App() {
                                             </td>
                                         </tr>
                                     ))}
-                                    {!filteredMedicines.length && <tr><td colSpan={5}>No medicines match this search.</td></tr>}
+                                    {!filteredMedicines.length && <tr><td colSpan={7}>No medicines match this search.</td></tr>}
                                 </tbody>
                             </table>
                             {dashboardData.medicines.filter((medicine) => !dashboardData.batches.some((batch) => batch.medicine_id === medicine.id)).length > 0 && (
@@ -1575,7 +1777,7 @@ export default function App() {
                                 <div>
                                     <div className="section-title">Batch CRUD</div>
                                     <h3>{editingBatchId ? 'Edit batch' : 'Create batch'}</h3>
-                                    {!editingBatchId && <p className="muted">Select a medicine already created in the Medicines page, then record its supplier batch and quantity.</p>}
+                                    {!editingBatchId && <p className="muted">A batch is one received lot of a catalogue medicine. Receiving stock updates available quantity, FEFO, expiry alerts, transactions, and reports.</p>}
                                 </div>
                                 <div className="recommendation">{canEdit ? 'Editable' : 'Read only'}</div>
                             </div>
@@ -1584,14 +1786,18 @@ export default function App() {
                                     label="Medicine"
                                     value={batchForm.medicine_id}
                                     onChange={(value) => setBatchForm((previous) => ({ ...previous, medicine_id: value }))}
-                                    disabled={!canEdit}
+                                    disabled={!canEdit || Boolean(editingBatchId)}
                                     select
                                     options={dashboardData.medicines
                                         .slice()
                                         .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
-                                        .map((medicine) => ({ label: `${medicine.name} (${medicine.sku})`, value: String(medicine.id) }))}
+                                        .map((medicine) => ({
+                                            label: `${medicine.name} (${medicine.sku})${medicine.active ? '' : ' — inactive; activate to receive stock'}`,
+                                            value: String(medicine.id),
+                                            disabled: !medicine.active,
+                                        }))}
                                 />
-                                <Field label="Batch number" value={batchForm.batch_number} onChange={(value) => setBatchForm((previous) => ({ ...previous, batch_number: value }))} disabled={!canEdit} />
+                                <Field label="Batch number" value={batchForm.batch_number} onChange={(value) => setBatchForm((previous) => ({ ...previous, batch_number: value }))} disabled={!canEdit || Boolean(editingBatchId)} />
                                 <Field label="Supplier" value={batchForm.supplier} onChange={(value) => setBatchForm((previous) => ({ ...previous, supplier: value }))} disabled={!canEdit} />
                                 <Field label="Quantity" value={batchForm.quantity} onChange={(value) => setBatchForm((previous) => ({ ...previous, quantity: value }))} disabled={!canEdit} />
                                 <Field label="Selling price (₹)" value={batchForm.unit_price} onChange={(value) => setBatchForm((previous) => ({ ...previous, unit_price: value }))} disabled={!canEdit} type="number" />
@@ -1773,10 +1979,8 @@ export default function App() {
                                 <Field label="Selected SKU or batch number" value={saleLookup} onChange={() => {}} disabled />
                                 <Field label="Unit price (₹)" value={salePrice} onChange={() => {}} type="number" disabled />
                                 <Field label="Quantity" value={saleQuantity} onChange={setSaleQuantity} type="number" />
-                                <Field label="Buyer name" value={buyerName} onChange={setBuyerName} />
-                                <Field label="Buyer phone (optional)" value={buyerPhone} onChange={setBuyerPhone} />
                                 </FormGrid>
-                                <div className="action-row"><button className="primary inline" onClick={sellMedicine}>Complete sale & generate bill</button><button className="secondary inline" onClick={() => { setLatestBill(null); setSaleSearch(''); setSaleLookup(''); setSelectedSaleBatchId(null); setSalePrice('0'); }}>Clear bill</button></div>
+                                <div className="action-row"><button className="primary inline" onClick={addSaleToCart} disabled={!canEdit || !selectedSaleBatch}>Add medicine to bill</button></div>
                             </div>
                             <div className="sale-catalogue">
                                 {saleMedicineCards.map((entry) => (
@@ -1795,9 +1999,61 @@ export default function App() {
                             </div>
                         </div>
                         <aside className="panel bill-preview">
-                            <div className="panel-header"><div><div className="section-title">Buyer bill</div><h3>{latestBill ? latestBill.invoice_number : 'Ready to generate'}</h3></div>{latestBill && <button className="ghost" onClick={() => window.print()}>Print bill</button>}</div>
-                            {latestBill ? <div className="invoice-sheet"><div className="invoice-brand">ArogyaMitra Pharmacy <span>PAID</span></div><p><strong>Buyer:</strong> {latestBill.buyer_name}<br />{latestBill.buyer_phone && <><strong>Phone:</strong> {latestBill.buyer_phone}<br /></>}<strong>Date:</strong> {new Date(latestBill.sold_at).toLocaleString()}</p><div className="invoice-line"><span>{latestBill.medicine_name}<small>{latestBill.sku} · Batch {latestBill.batch_number}</small></span><b>{latestBill.quantity} × ₹{latestBill.unit_price.toFixed(2)}</b></div><div className="invoice-total"><span>Total paid</span><strong>₹{latestBill.total_amount.toFixed(2)}</strong></div><small>Sold by {latestBill.sold_by} · Please retain this bill for your records.</small></div> : <div className="bill-empty">Complete a sale to create an itemised, printable buyer bill.</div>}
+                            <div className="bill-cart">
+                                <div className="panel-header"><div><div className="section-title">Current bill</div><h3>{saleCart.length} medicine{saleCart.length === 1 ? '' : 's'}</h3></div>{saleCart.length > 0 && <button className="ghost danger" onClick={() => setSaleCart([])}>Clear cart</button>}</div>
+                                {saleCart.length > 0 ? <div className="bill-cart-items">{saleCart.map((line) => (
+                                    <div className="invoice-line" key={line.medicine_id}>
+                                        <span>{line.medicine_name}<small>{line.sku} · Qty {line.quantity} · {line.available_quantity} available</small></span>
+                                        <button className="ghost danger" onClick={() => setSaleCart((previous) => previous.filter((entry) => entry.medicine_id !== line.medicine_id))}>Remove</button>
+                                    </div>
+                                ))}</div> : <div className="bill-empty">Choose a medicine and add it to build a multi-item bill.</div>}
+                                <FormGrid>
+                                    <label className="field"><span>CRM customer (optional)</span><select value={saleCustomerId} onChange={(event) => {
+                                        const customer = customers.find((entry) => entry.id === Number(event.target.value));
+                                        setSaleCustomerId(event.target.value);
+                                        if (customer) { setBuyerName(customer.name); setBuyerPhone(customer.phone ?? ''); }
+                                    }}><option value="">Walk-in / unlinked buyer</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}{customer.phone ? ` · ${customer.phone}` : ''}</option>)}</select></label>
+                                    <Field label="Buyer name" value={buyerName} onChange={setBuyerName} />
+                                    <Field label="Buyer phone (optional)" value={buyerPhone} onChange={setBuyerPhone} />
+                                </FormGrid>
+                                <div className="action-row">
+                                    <button className="primary inline" onClick={sellMedicine} disabled={!canEdit || saleCart.length === 0 || buyerName.trim().length < 2}>Complete sale & generate bill</button>
+                                    <button className="secondary inline" onClick={() => { setLatestBill(null); setSaleCart([]); setSaleSearch(''); setSaleLookup(''); setSelectedSaleBatchId(null); setSalePrice('0'); }}>Clear bill</button>
+                                </div>
+                            </div>
+                            <div className="latest-invoice" id="latest-invoice">
+                                <div className="panel-header"><div><div className="section-title">Buyer bill</div><h3>{latestBill ? latestBill.invoice_number : 'Ready to generate'}</h3></div>{latestBill && <button className="ghost" onClick={() => window.print()}>Print bill</button>}</div>
+                                {latestBill ? <div className="invoice-sheet"><div className="invoice-brand">ArogyaMitra Pharmacy <span>INVOICE</span></div><p><strong>Buyer:</strong> {latestBill.buyer_name}<br />{latestBill.buyer_phone && <><strong>Phone:</strong> {latestBill.buyer_phone}<br /></>}<strong>Date:</strong> {parseInvoiceDate(latestBill.sold_at).toLocaleString()}</p>{latestBill.items.map((line, index) => <div className="invoice-line" key={`${line.sku}-${index}`}><span>{line.medicine_name}<small>{line.sku} · Batch {line.batch_number}</small><small>{line.quantity} × ₹{line.unit_price.toFixed(2)} each</small></span><b>₹{line.total_amount.toFixed(2)}</b></div>)}<div className="invoice-total"><span>Invoice total</span><strong>₹{latestBill.total_amount.toFixed(2)}</strong></div><small>Sold by {latestBill.sold_by} · Payment is tracked separately in the business workspace.</small></div> : <div className="bill-empty">Complete a sale to create an itemised, printable buyer bill.</div>}
+                            </div>
                         </aside>
+                        <div className="panel sales-history-panel">
+                            <div className="panel-header"><div><div className="section-title">Bill history</div><h3>Today’s and previous bills</h3><p className="muted">Every generated bill is saved here. Select a bill to reopen it in the preview and print it.</p></div><span className="recommendation">{saleInvoices.length} bills</span></div>
+                            {[{ title: "Today's bills", invoices: billHistory.today }, { title: 'Previous bills', invoices: billHistory.previous }].map(({ title, invoices }) => (
+                                <div className="bill-history-group" key={title}>
+                                    <div className="bill-history-heading"><h4>{title}</h4><span>{invoices.length} bill{invoices.length === 1 ? '' : 's'}</span></div>
+                                    {invoices.length > 0 ? (
+                                        <div className="table-scroll">
+                                            <table className="data-table">
+                                                <thead><tr><th>Bill number</th><th>Buyer</th><th>Date & time</th><th>Items</th><th>Total</th><th>Action</th></tr></thead>
+                                                <tbody>{invoices.map((invoice) => (
+                                                    <tr key={invoice.invoice_number}>
+                                                        <td><strong>{invoice.invoice_number}</strong></td>
+                                                        <td>{invoice.buyer_name}</td>
+                                                        <td>{parseInvoiceDate(invoice.sold_at).toLocaleString()}</td>
+                                                        <td>{invoice.items.length}</td>
+                                                        <td>₹{invoice.total_amount.toFixed(2)}</td>
+                                                        <td><button className="ghost" onClick={() => {
+                                                            setLatestBill(invoice);
+                                                            document.getElementById('latest-invoice')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                                        }}>View bill</button></td>
+                                                    </tr>
+                                                ))}</tbody>
+                                            </table>
+                                        </div>
+                                    ) : <div className="bill-empty">{title === "Today's bills" ? 'No bills have been generated today.' : 'No previous bills yet.'}</div>}
+                                </div>
+                            ))}
+                        </div>
                     </section>
                 )}
 
@@ -1937,14 +2193,14 @@ export default function App() {
                         <div className="panel finance-intro">
                             <div>
                                 <div className="section-title">Finance centre</div>
-                                <h3>Sales in, purchases out — clearly separated</h3>
-                                <p className="muted">Track money received from buyers separately from supplier commitments and orders.</p>
+                                <h3>Sales invoiced and purchases committed</h3>
+                                <p className="muted">Sales show invoice value, not collected cash. Payment receipts and invoice balances are tracked separately in the business workspace.</p>
                             </div>
                             <div className="finance-updated">Live pharmacy totals</div>
                         </div>
 
                         <div className="finance-summary">
-                            <StatCard label="Sales received" value={`₹${(financials?.sales_total ?? 0).toLocaleString()}`} tone="teal" />
+                            <StatCard label="Sales invoiced" value={`₹${(financials?.sales_total ?? 0).toLocaleString()}`} tone="teal" />
                             <StatCard label="Bills issued" value={financials?.sales_count ?? 0} tone="blue" />
                             <StatCard label="Purchase committed" value={`₹${(financials?.purchases_total ?? 0).toLocaleString()}`} tone="gold" />
                             <StatCard label="Supplier orders" value={financials?.purchase_count ?? 0} tone="red" />
@@ -1955,7 +2211,7 @@ export default function App() {
                                 <div className="panel-header">
                                     <div>
                                         <div className="section-title">Sales ledger</div>
-                                        <h3>Money received from customers</h3>
+                                        <h3>Customer invoices issued</h3>
                                     </div>
                                     <strong className="ledger-total">₹{(financials?.sales_total ?? 0).toLocaleString()}</strong>
                                 </div>
@@ -1964,7 +2220,7 @@ export default function App() {
                                         <span className="finance-highlight-icon">₹</span>
                                         <div>
                                             <strong>{latestBill.invoice_number}</strong>
-                                            <span>{latestBill.medicine_name} · {latestBill.buyer_name}</span>
+                                            <span>{latestBill.items.length} medicine{latestBill.items.length === 1 ? '' : 's'} · {latestBill.buyer_name}</span>
                                             <small>{new Date(latestBill.sold_at).toLocaleString()} · {latestBill.quantity} units</small>
                                         </div>
                                         <b>₹{latestBill.total_amount.toLocaleString()}</b>
@@ -2007,46 +2263,80 @@ export default function App() {
                 )}
 
                 {activeTab === 'business' && (
-                    <section className="workspace-grid">
-                        <div className="panel">
+                    <section className="workspace-grid business-workspace">
+                        <div className="panel gst-profile-panel">
                             <div className="panel-header"><div><div className="section-title">GST and tax</div><h3>Optional pharmacy tax profile</h3></div><span className="recommendation">Additive module</span></div>
+                            <div className="gst-scope-note"><strong>Profile only — GST is not applied to invoices.</strong><span>Sale invoices and accounting totals currently exclude calculated GST. This profile is not a GST-compliant invoice or tax filing record.</span></div>
+                            <div className="tax-profile-summary">
+                                <div><small>Profile status</small><strong>{taxProfile ? 'Configured' : 'Not configured'}</strong></div>
+                                <div><small>Saved GSTIN</small><strong>{taxProfile?.gstin || 'Not set'}</strong></div>
+                                <div><small>Default rate</small><strong>{taxProfile?.default_gst_rate ?? 0}%</strong></div>
+                                <div><small>State code</small><strong>{taxProfile?.state_code || 'Not set'}</strong></div>
+                            </div>
                             <FormGrid>
                                 <Field label="GSTIN" value={businessForm.gstin} onChange={(value) => setBusinessForm((previous) => ({ ...previous, gstin: value }))} />
                                 <Field label="Legal name" value={businessForm.legal_name} onChange={(value) => setBusinessForm((previous) => ({ ...previous, legal_name: value }))} />
-                                <Field label="Default GST rate (%)" value={businessForm.default_gst_rate} onChange={(value) => setBusinessForm((previous) => ({ ...previous, default_gst_rate: value }))} type="number" />
+                                <label className="field"><span>Default GST rate (%)</span><input type="number" min="0" max="100" step="0.01" value={businessForm.default_gst_rate} onChange={(event) => setBusinessForm((previous) => ({ ...previous, default_gst_rate: event.target.value }))} /></label>
                                 <Field label="State code" value={businessForm.state_code} onChange={(value) => setBusinessForm((previous) => ({ ...previous, state_code: value }))} />
                             </FormGrid>
-                            <button className="primary inline" onClick={saveTaxProfile}>Save GST profile</button>
-                            {taxProfile?.gstin && <p className="muted">Configured GSTIN: {taxProfile.gstin} · Default rate: {taxProfile.default_gst_rate}%</p>}
+                            <button className="primary inline" onClick={saveTaxProfile} disabled={currentUser?.role !== 'admin'}>Save GST profile</button>
+                            {currentUser?.role !== 'admin' && <small className="muted">Only a pharmacy administrator can change this profile.</small>}
                         </div>
-                        <div className="panel">
-                            <div className="section-title">Accounting summary</div>
-                            <div className="stats-grid compact-grid">
-                                <StatCard label="Payments received" value={`₹${(accountingSummary?.payments_received ?? 0).toLocaleString()}`} tone="teal" />
+                        <div className="panel accounting-summary-panel">
+                            <div className="panel-header"><div><div className="section-title">Accounting summary</div><h3>Invoice and payment position</h3><p className="muted">Payments received includes allocated and unallocated receipts. Only payments linked to an invoice reduce its outstanding balance.</p></div><span className="recommendation">{saleInvoices.length} invoices</span></div>
+                            <div className="accounting-stats">
+                                <StatCard label="Sales invoiced" value={`₹${(accountingSummary?.sales_total ?? 0).toLocaleString()}`} tone="teal" />
+                                <StatCard label="Payments received" value={`₹${(accountingSummary?.payments_received ?? 0).toLocaleString()}`} tone="blue" />
                                 <StatCard label="Outstanding" value={`₹${(accountingSummary?.outstanding ?? 0).toLocaleString()}`} tone="gold" />
-                                <StatCard label="GST recorded" value={`₹${(accountingSummary?.gst_total ?? 0).toLocaleString()}`} tone="blue" />
+                                <StatCard label="Recorded debits" value={`₹${(accountingSummary?.debit_total ?? 0).toLocaleString()}`} tone="red" />
+                                <StatCard label="Recorded credits" value={`₹${(accountingSummary?.credit_total ?? 0).toLocaleString()}`} tone="blue" />
+                                <StatCard label="GST recorded" value={`₹${(accountingSummary?.gst_total ?? 0).toLocaleString()}`} tone="gold" />
                             </div>
-                            <FormGrid><Field label="Payment amount (₹)" value={businessForm.payment_amount} onChange={(value) => setBusinessForm((previous) => ({ ...previous, payment_amount: value }))} type="number" /><Field label="Payment method" value={businessForm.payment_method} onChange={(value) => setBusinessForm((previous) => ({ ...previous, payment_method: value }))} /></FormGrid>
-                            <button className="primary inline" onClick={recordPayment}>Record payment</button>
+                            <div className="payment-entry">
+                                <div className="section-title">Record a payment</div>
+                                <FormGrid>
+                                    <label className="field"><span>Apply payment to invoice (optional)</span><select value={businessForm.payment_invoice_number} onChange={(event) => setBusinessForm((previous) => ({ ...previous, payment_invoice_number: event.target.value }))}><option value="">Unallocated payment</option>{saleInvoices.map((invoice) => {
+                                        const paid = payments.filter((payment) => payment.invoice_number === invoice.invoice_number && payment.status === 'recorded').reduce((total, payment) => total + payment.amount, 0);
+                                        const balance = Math.max(invoice.total_amount - paid, 0);
+                                        return balance > 0 ? <option key={invoice.invoice_number} value={invoice.invoice_number}>{invoice.invoice_number} · {invoice.buyer_name} · due ₹{balance.toFixed(2)}</option> : null;
+                                    })}</select></label>
+                                    <Field label="Payment amount (₹)" value={businessForm.payment_amount} onChange={(value) => setBusinessForm((previous) => ({ ...previous, payment_amount: value }))} type="number" />
+                                    <Field label="Payment method" value={businessForm.payment_method} onChange={(value) => setBusinessForm((previous) => ({ ...previous, payment_method: value }))} />
+                                </FormGrid>
+                                <small className="muted">Unallocated payments are recorded but do not reduce invoice balances.</small>
+                                <button className="primary inline" onClick={recordPayment}>Record payment</button>
+                            </div>
                         </div>
                         <div className="panel">
-                            <div className="section-title">Customers and loyalty</div>
+                            <div className="section-title">Customer CRM</div>
                             <h3>Customer register</h3>
-                            <FormGrid><Field label="Customer name" value={businessForm.customer_name} onChange={(value) => setBusinessForm((previous) => ({ ...previous, customer_name: value }))} /><Field label="Phone" value={businessForm.customer_phone} onChange={(value) => setBusinessForm((previous) => ({ ...previous, customer_phone: value }))} /></FormGrid>
+                            <FormGrid><Field label="Customer name" value={businessForm.customer_name} onChange={(value) => setBusinessForm((previous) => ({ ...previous, customer_name: value }))} /><Field label="Phone" value={businessForm.customer_phone} onChange={(value) => setBusinessForm((previous) => ({ ...previous, customer_phone: value }))} /><Field label="Email (optional)" value={businessForm.customer_email} onChange={(value) => setBusinessForm((previous) => ({ ...previous, customer_email: value }))} /></FormGrid>
                             <button className="primary inline" onClick={createCustomer}>Add customer</button>
-                            <table className="data-table"><thead><tr><th>Name</th><th>Phone</th><th>Loyalty points</th><th>Credit limit</th></tr></thead><tbody>{customers.map((customer) => <tr key={customer.id}><td>{customer.name}</td><td>{customer.phone ?? '—'}</td><td>{customer.loyalty_points}</td><td>₹{customer.credit_limit.toLocaleString()}</td></tr>)}</tbody></table>
+                            <div className="table-toolbar"><input type="search" value={customerSearch} onChange={(event) => setCustomerSearch(event.target.value)} placeholder="Search customers by name, phone, or email..." /></div>
+                            <div className="table-scroll"><table className="data-table"><thead><tr><th>Name</th><th>Contact</th><th>Prescriptions</th><th>Sales</th><th>Outstanding</th></tr></thead><tbody>{customers.filter((customer) => `${customer.name} ${customer.phone ?? ''} ${customer.email ?? ''}`.toLowerCase().includes(customerSearch.toLowerCase())).map((customer) => {
+                                const invoices = saleInvoices.filter((invoice) => invoice.customer_id === customer.id);
+                                const due = invoices.reduce((sum, invoice) => sum + Math.max(invoice.total_amount - payments.filter((payment) => payment.invoice_number === invoice.invoice_number && payment.status === 'recorded').reduce((paid, payment) => paid + payment.amount, 0), 0), 0);
+                                return <tr key={customer.id}><td><strong>{customer.name}</strong></td><td>{customer.phone ?? '—'}<small>{customer.email ?? ''}</small></td><td>{prescriptions.filter((prescription) => prescription.customer_id === customer.id).length}</td><td>{invoices.length}</td><td>₹{due.toLocaleString()}</td></tr>;
+                            })}{!customers.length && <tr><td colSpan={5}>No customers yet. Add one, then select them when creating a sale or prescription.</td></tr>}</tbody></table></div>
                         </div>
                         <div className="panel">
                             <div className="section-title">Prescriptions</div>
                             <h3>Patient prescription register</h3>
-                            <FormGrid><Field label="Patient name" value={businessForm.patient_name} onChange={(value) => setBusinessForm((previous) => ({ ...previous, patient_name: value }))} /><Field label="Doctor name" value={businessForm.doctor_name} onChange={(value) => setBusinessForm((previous) => ({ ...previous, doctor_name: value }))} /><Field label="Prescription number" value={businessForm.prescription_number} onChange={(value) => setBusinessForm((previous) => ({ ...previous, prescription_number: value }))} /><Field label="Medicine summary" value={businessForm.medicine_summary} onChange={(value) => setBusinessForm((previous) => ({ ...previous, medicine_summary: value }))} /></FormGrid>
+                            <FormGrid>
+                                <label className="field"><span>Link to customer (optional)</span><select value={businessForm.prescription_customer_id} onChange={(event) => {
+                                    const customer = customers.find((entry) => entry.id === Number(event.target.value));
+                                    setBusinessForm((previous) => ({ ...previous, prescription_customer_id: event.target.value, patient_name: customer?.name ?? previous.patient_name }));
+                                }}><option value="">Unlinked patient</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
+                                <Field label="Patient name" value={businessForm.patient_name} onChange={(value) => setBusinessForm((previous) => ({ ...previous, patient_name: value }))} /><Field label="Doctor name" value={businessForm.doctor_name} onChange={(value) => setBusinessForm((previous) => ({ ...previous, doctor_name: value }))} /><Field label="Prescription number" value={businessForm.prescription_number} onChange={(value) => setBusinessForm((previous) => ({ ...previous, prescription_number: value }))} /><Field label="Medicine summary" value={businessForm.medicine_summary} onChange={(value) => setBusinessForm((previous) => ({ ...previous, medicine_summary: value }))} />
+                            </FormGrid>
                             <button className="primary inline" onClick={createPrescription}>Save prescription</button>
-                            <table className="data-table"><thead><tr><th>Patient</th><th>Doctor</th><th>Prescription</th><th>Date</th></tr></thead><tbody>{prescriptions.map((prescription) => <tr key={prescription.id}><td>{prescription.patient_name}</td><td>{prescription.doctor_name ?? '—'}</td><td>{prescription.prescription_number}</td><td>{prescription.prescribed_on}</td></tr>)}</tbody></table>
+                            <div className="table-toolbar"><input type="search" value={prescriptionSearch} onChange={(event) => setPrescriptionSearch(event.target.value)} placeholder="Search patient, doctor, or prescription number..." /></div>
+                            <div className="table-scroll"><table className="data-table"><thead><tr><th>Patient</th><th>Doctor</th><th>Prescription</th><th>Medicine summary</th><th>Date</th></tr></thead><tbody>{prescriptions.filter((prescription) => `${prescription.patient_name} ${prescription.doctor_name ?? ''} ${prescription.prescription_number} ${prescription.medicine_summary}`.toLowerCase().includes(prescriptionSearch.toLowerCase())).map((prescription) => <tr key={prescription.id}><td>{prescription.patient_name}{prescription.customer_id && <small>CRM linked</small>}</td><td>{prescription.doctor_name ?? '—'}</td><td>{prescription.prescription_number}</td><td>{prescription.medicine_summary}</td><td>{prescription.prescribed_on}</td></tr>)}{!prescriptions.length && <tr><td colSpan={5}>No prescriptions saved yet.</td></tr>}</tbody></table></div>
                         </div>
                         <div className="panel">
                             <div className="section-title">Payments and B2B exchange</div>
                             <p className="muted">Payment records are stored locally for demonstration. Exchange listings provide the foundation for pharmacy-to-pharmacy stock requests without changing current stock.</p>
-                            <table className="data-table"><thead><tr><th>Payment reference</th><th>Amount</th><th>Method</th><th>Status</th></tr></thead><tbody>{payments.slice(0, 8).map((payment) => <tr key={payment.id}><td>{payment.reference}</td><td>₹{payment.amount.toLocaleString()}</td><td>{payment.method}</td><td>{payment.status}</td></tr>)}</tbody></table>
+                            <div className="table-scroll"><table className="data-table"><thead><tr><th>Payment reference</th><th>Invoice</th><th>Amount</th><th>Method</th><th>Status</th></tr></thead><tbody>{payments.slice(0, 8).map((payment) => <tr key={payment.id}><td>{payment.reference}</td><td>{payment.invoice_number ?? 'Unallocated'}</td><td>₹{payment.amount.toLocaleString()}</td><td>{payment.method}</td><td>{payment.status}</td></tr>)}{!payments.length && <tr><td colSpan={5}>No payments recorded yet.</td></tr>}</tbody></table></div>
                             <p className="muted">{exchangeListings.length} open exchange listing(s) currently available.</p>
                         </div>
                     </section>
@@ -2074,9 +2364,11 @@ export default function App() {
                             <div className="panel department-detail-panel">
                                 <div className="panel-header"><div><div className="section-title">Selected department</div><h3>{selectedDepartmentSummary.name}</h3><p className="muted">{selectedDepartmentSummary.floor} floor · Extension {selectedDepartmentSummary.contact_extension}</p></div><span className="recommendation">{selectedDepartmentSummary.totalQuantity} units ready</span></div>
                                 {selectedDepartmentSummary.stock.length ? <div className="department-stock-grid">{selectedDepartmentSummary.stock.map((item) => {
-                                    const batch = dashboardData.batches.find((entry) => entry.batch_number === item.batch_number);
-                                    const expired = batch && new Date(batch.expiry_date) < new Date();
-                                    return <article className="department-stock-card" key={item.id}><div><span className="section-title">READY TO USE</span><h3>{item.medicine_name}</h3><p>Batch {item.batch_number}</p></div><strong>{item.quantity}</strong><small>units · expires {batch?.expiry_date ?? 'not available'}</small>{expired && batch ? <button className="ghost danger" onClick={() => emailSupplierForReturn(batch)}>Email supplier for return</button> : <><span className="ready-badge">Available in department</span><button className="secondary inline" onClick={() => useDepartmentStock(item)} disabled={!canEdit}>Record medicine use</button></>}</article>;
+                                    const batch = dashboardData.batches.find((entry) => entry.medicine_id === item.medicine_id && entry.batch_number === item.batch_number);
+                                    const expired = !batch || new Date(`${batch.expiry_date}T00:00:00`) < new Date(new Date().toDateString());
+                                    const quarantined = batch?.disposal_status !== 'active';
+                                    const unavailable = expired || quarantined;
+                                    return <article className="department-stock-card" key={item.id}><div><span className="section-title">{unavailable ? 'NOT AVAILABLE FOR USE' : 'READY TO USE'}</span><h3>{item.medicine_name}</h3><p>Batch {item.batch_number}</p></div><strong>{item.quantity}</strong><small>units · expires {batch?.expiry_date ?? 'not available'}</small>{expired && batch ? <button className="ghost danger" onClick={() => emailSupplierForReturn(batch)}>Email supplier for return</button> : unavailable ? <span className="ready-badge">Quarantined — collection workflow required</span> : <><span className="ready-badge">Available in department</span><button className="secondary inline" onClick={() => useDepartmentStock(item)} disabled={!canEdit}>Record medicine use</button></>}</article>;
                                 })}</div> : <div className="department-empty"><strong>No medicine issued yet</strong><p>Use FEFO Dispensing, select {selectedDepartmentSummary.name}, and issue a batch to add ready-to-use stock here.</p><button className="primary inline" onClick={() => navigate('dispense')}>Open FEFO Dispensing</button></div>}
                             </div>
                         )}
@@ -2246,7 +2538,7 @@ function Field({
     type?: string;
     textarea?: boolean;
     select?: boolean;
-    options?: { label: string; value: string }[];
+    options?: { label: string; value: string; disabled?: boolean }[];
 }) {
     return (
         <label className="field">
@@ -2255,7 +2547,7 @@ function Field({
                 <select value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled}>
                     <option value="">Select one</option>
                     {options.map((option) => (
-                        <option key={option.value} value={option.value}>{option.label}</option>
+                        <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>
                     ))}
                 </select>
             ) : textarea ? (

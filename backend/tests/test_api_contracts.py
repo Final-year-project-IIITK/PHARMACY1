@@ -14,6 +14,7 @@ def test_health_contract() -> None:
     assert response.status_code in {200, 503}
     if response.status_code == 200:
         assert response.json()["status"] == "ok"
+        assert float(response.headers["X-Response-Time-Ms"]) >= 0
 
 
 def test_login_rejects_empty_credentials_before_database_access() -> None:
